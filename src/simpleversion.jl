@@ -6,7 +6,7 @@ struct SimpleVersion
     major::UInt32
     minor::UInt32
 
-    SimpleVersion(major, minor=0) = new(major, minor)
+    SimpleVersion(major, minor = 0) = new(major, minor)
 end
 
 function Base.tryparse(::Type{SimpleVersion}, v::AbstractString)
@@ -18,7 +18,7 @@ function Base.tryparse(::Type{SimpleVersion}, v::AbstractString)
     end
     any(isnothing, int_parts) && return nothing
 
-    SimpleVersion(int_parts...)
+    return SimpleVersion(int_parts...)
 end
 
 function Base.parse(::Type{SimpleVersion}, v::AbstractString)
@@ -38,5 +38,5 @@ SimpleVersion(v::AbstractString) = parse(SimpleVersion, v)
 end
 
 macro sv_str(str)
-    SimpleVersion(str)
+    return SimpleVersion(str)
 end

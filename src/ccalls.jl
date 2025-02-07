@@ -61,7 +61,7 @@ macro debug_ccall(ex)
     # avoid task switches
     io = :(Core.stdout)
 
-    quote
+    return quote
         print($io, $(string(target)), '(')
         for (i, arg) in enumerate(($(map(esc, args)...),))
             i > 1 && print($io, ", ")
@@ -115,13 +115,15 @@ function ccall_macro_lower(func, rettype, types, args, nreq)
         $(unsafe_convert_exprs...)
 
         gc_state = @ccall(jl_gc_safe_enter()::Int8)
-        ret = ccall($(esc(func)), $(esc(rettype)), $(Expr(:tuple, map(esc, types)...)),
-                    $(unsafe_convert_args...))
+        ret = ccall(
+            $(esc(func)), $(esc(rettype)), $(Expr(:tuple, map(esc, types)...)),
+            $(unsafe_convert_args...)
+        )
         @ccall(jl_gc_safe_leave(gc_state::Int8)::Cvoid)
         ret
     end
 
-    quote
+    return quote
         @inline
         $(cconvert_exprs...)
         GC.@preserve $(cconvert_args...) $(call)
@@ -136,5 +138,5 @@ useful for functions that may block, so that the GC isn't blocked from running, 
 be required to prevent deadlocks (see JuliaGPU/CUDA.jl#2261).
 """
 macro gcsafe_ccall(expr)
-    ccall_macro_lower(Base.ccall_macro_parse(expr)...)
+    return ccall_macro_lower(Base.ccall_macro_parse(expr)...)
 end
