@@ -1,0 +1,6 @@
+name = "GPUUtils"
+uuid = "096a3bc2-3ced-46d0-87f4-dd12716f4bfc"
+version = "0.1.0"
+
+[compat]
+julia = "1.10"

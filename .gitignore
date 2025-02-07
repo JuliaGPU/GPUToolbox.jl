@@ -1,0 +1,10 @@
+*.jl.*.cov
+*.jl.cov
+*.jl.mem
+*.nsys-rep
+alloc-profile.pb.gz
+
+.vscode
+lcov.info
+
+/Manifest.toml
