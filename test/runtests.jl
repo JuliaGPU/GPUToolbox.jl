@@ -1,7 +1,7 @@
 using Test
-using GPUUtils
+using GPUToolbox
 
-@testset "GPUUtils.jl" begin
+@testset "GPUToolbox.jl" begin
     @testset "SimpleVersion" begin
         # Construct
         sv1 = SimpleVersion(42)
