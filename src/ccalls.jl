@@ -45,7 +45,11 @@ macro checked(ex)
 end
 
 ## version of ccall that prints the ccall, its arguments and its return value
+"""
+    @debug_ccall ...
 
+A version of `ccall`` that prints the ccall, its arguments, and its return value.
+"""
 macro debug_ccall(ex)
     @assert Meta.isexpr(ex, :(::))
     call, ret = ex.args

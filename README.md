@@ -14,3 +14,14 @@
 
 [codecov-img]: https://codecov.io/gh/JuliaGPU/GPUToolbox.jl/branch/master/graph/badge.svg
 [codecov-url]: https://codecov.io/gh/JuliaGPU/GPUToolbox.jl
+
+## Functionality
+
+This package currently exports the following:
+- `SimpleVersion`: a GPU-compatible version number
+- `@sv_str`: constructs a SimpleVersion from a string
+- `@checked`: Add to a function definition to generate an unchecked and a checked version.
+- `@debug_ccall`: like `ccall` but prints the ccall, its arguments, and its return value
+- `@gcsafe_ccall`: like `@ccall` but marking it safe for the GC to run.
+
+For more details, check out the docstrings using the Julia REPL.

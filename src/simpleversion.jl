@@ -1,7 +1,11 @@
-## a GPU-compatible version number
-
 export SimpleVersion, @sv_str
 
+"""
+    SimpleVersion(major, [minor])
+    SimpleVersion(v::AbstractString)
+
+A GPU-compatible version number.
+"""
 struct SimpleVersion
     major::UInt32
     minor::UInt32
@@ -37,6 +41,11 @@ SimpleVersion(v::AbstractString) = parse(SimpleVersion, v)
     return false
 end
 
+"""
+    sv"str"
+
+Construct a `SimpleVersion` from `str`.
+"""
 macro sv_str(str)
     return SimpleVersion(str)
 end
