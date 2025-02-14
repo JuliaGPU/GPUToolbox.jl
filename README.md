@@ -17,7 +17,7 @@
 
 ## Functionality
 
-This package currently exports the following:
+This package currently has the following public symbols:
 - `SimpleVersion`: a GPU-compatible version number
 - `@sv_str`: constructs a SimpleVersion from a string
 - `@checked`: Add to a function definition to generate an unchecked and a checked version.
