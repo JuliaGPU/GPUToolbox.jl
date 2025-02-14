@@ -24,4 +24,4 @@ This package currently exports the following:
 - `@debug_ccall`: like `ccall` but prints the ccall, its arguments, and its return value
 - `@gcsafe_ccall`: like `@ccall` but marking it safe for the GC to run.
 
-For more details, check out the docstrings using the Julia REPL.
+For more details on a specific symbol, check out its docstring in the Julia REPL.
