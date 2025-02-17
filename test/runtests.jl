@@ -1,5 +1,5 @@
 using Test
-using GPUToolbox
+using GPUToolbox: SimpleVersion, @sv_str
 
 @testset "GPUToolbox.jl" begin
     @testset "SimpleVersion" begin
