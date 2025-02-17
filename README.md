@@ -6,7 +6,7 @@
 |:--------------------------------------------------------------:|:-------------------------------:|
 | [![][gha-img]][gha-url] [![PkgEval][pkgeval-img]][pkgeval-url] | [![][codecov-img]][codecov-url] |
 
-[gha-img]: https://github.com/JuliaGPU/GPUToolbox.jl/workflows/Test/badge.svg
+[gha-img]: https://github.com/JuliaGPU/GPUToolbox.jl/actions/workflows/Test.yml/badge.svg?branch=main
 [gha-url]: https://github.com/JuliaGPU/GPUToolbox.jl/actions
 
 [pkgeval-img]: https://juliaci.github.io/NanosoldierReports/pkgeval_badges/G/GPUToolbox.svg
