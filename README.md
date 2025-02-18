@@ -12,7 +12,7 @@
 [pkgeval-img]: https://juliaci.github.io/NanosoldierReports/pkgeval_badges/G/GPUToolbox.svg
 [pkgeval-url]: https://juliaci.github.io/NanosoldierReports/pkgeval_badges/G/GPUToolbox.html
 
-[codecov-img]: https://codecov.io/gh/JuliaGPU/GPUToolbox.jl/branch/master/graph/badge.svg
+[codecov-img]: https://codecov.io/gh/JuliaGPU/GPUToolbox.jl/branch/main/graph/badge.svg
 [codecov-url]: https://codecov.io/gh/JuliaGPU/GPUToolbox.jl
 
 ## Functionality
