@@ -1,7 +1,8 @@
 # utilities for calling foreign functionality more conveniently
 
-export @checked, @debug_ccall, @gcsafe_ccall
-
+if VERSION >= v"1.11.0-DEV.469"
+    eval(Meta.parse("public @checked, @debug_ccall, @gcsafe_ccall"))
+end
 
 ## function wrapper for checking the return value of a function
 
