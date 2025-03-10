@@ -105,8 +105,7 @@ useful for functions that may block, so that the GC isn't blocked from running, 
 be required to prevent deadlocks (see JuliaGPU/CUDA.jl#2261).
 
 Note that this is generally only safe with non-Julia C functions that do not call back into
-Julia. When using callbacks, the code should make sure to transition back into GC-unsafe
-mode using the `@gcunsafe` macro.
+the Julia directly.
 """
 macro gcsafe_ccall end
 

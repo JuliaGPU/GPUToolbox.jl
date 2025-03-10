@@ -42,5 +42,19 @@ using GPUToolbox
         @test !(sv2 > sv2) # Default
     end
 
-    # TODO: @debug_ccall and @gcsafe_ccall tests
+    @testset "gcsafe_ccall" begin
+        function gc_safe_ccall()
+            # jl_rand is marked as JL_NOTSAFEPOINT
+            @gcsafe_ccall gc_safe=true jl_rand()::UInt64
+        end
+        
+        let llvm = sprint(code_llvm, gc_safe_ccall, ())
+            # check that the call works
+            @test gc_safe_ccall() isa UInt64
+            # check for the gc_safe store
+            @test occursin("store atomic i8 2", llvm)
+        end
+    end
+
+    # TODO: @debug_ccall tests
 end
