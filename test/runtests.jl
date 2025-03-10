@@ -45,9 +45,9 @@ using GPUToolbox
     @testset "gcsafe_ccall" begin
         function gc_safe_ccall()
             # jl_rand is marked as JL_NOTSAFEPOINT
-            @gcsafe_ccall gc_safe=true jl_rand()::UInt64
+            @gcsafe_ccall jl_rand()::UInt64
         end
-        
+
         let llvm = sprint(code_llvm, gc_safe_ccall, ())
             # check that the call works
             @test gc_safe_ccall() isa UInt64
