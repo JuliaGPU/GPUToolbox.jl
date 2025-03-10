@@ -1,5 +1,6 @@
 using Test
 using GPUToolbox
+using InteractiveUtils
 
 @testset "GPUToolbox.jl" begin
     @testset "SimpleVersion" begin
@@ -42,8 +43,6 @@ using GPUToolbox
         @test !(sv2 > sv2) # Default
     end
 
-    # TODO: @debug_ccall and @gcsafe_ccall tests
-
     @testset "Literals" begin
         @test 1i8 === Int8(1)
         @test 1i16 === Int16(1)
@@ -55,4 +54,28 @@ using GPUToolbox
         @test 1u32 === UInt32(1)
         @test_throws InexactError 256u8
     end
+
+    @testset "gcsafe_ccall" begin
+        function gc_safe_ccall()
+            # jl_rand is marked as JL_NOTSAFEPOINT
+            @gcsafe_ccall jl_rand()::UInt64
+        end
+
+        let llvm = sprint(code_llvm, gc_safe_ccall, ())
+            # check that the call works
+            @test gc_safe_ccall() isa UInt64
+            # v1.10 is hard to test since ccall are just raw runtime pointers
+            if VERSION >= v"1.11"
+                if !GPUToolbox.HAS_CCALL_GCSAFE
+                    # check for the gc_safe store
+                    @test occursin("jl_gc_safe_enter", llvm)
+                    @test occursin("jl_gc_safe_leave", llvm)
+                else
+                    @test occursin("store atomic i8 2", llvm)
+                end
+            end
+        end
+    end
+
+    # TODO: @debug_ccall tests
 end
