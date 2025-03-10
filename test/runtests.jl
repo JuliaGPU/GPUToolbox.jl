@@ -43,4 +43,16 @@ using GPUToolbox
     end
 
     # TODO: @debug_ccall and @gcsafe_ccall tests
+
+    @testset "Literals" begin
+        @test 1i8 === Int8(1)
+        @test 1i16 === Int16(1)
+        @test 1i32 === Int32(1)
+        @test_throws InexactError 128i8
+
+        @test 1u8 === UInt8(1)
+        @test 1u16 === UInt16(1)
+        @test 1u32 === UInt32(1)
+        @test_throws InexactError 256u8
+    end
 end
