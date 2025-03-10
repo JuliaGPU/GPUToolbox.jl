@@ -111,51 +111,51 @@ macro gcsafe_ccall end
 
 if HAS_CCALL_GCSAFE
     macro gcsafe_ccall(exprs)
-        exprs = pushfirst(exprs, :(gc_safe = true))
+        exprs = pushfirst!(exprs, :(gc_safe = true))
         return Base.ccall_macro_lower((:ccall), Base.ccall_macro_parse(exprs)...)
     end
 else
-function ccall_macro_lower(func, rettype, types, args, nreq)
-    # instead of re-using ccall or Expr(:foreigncall) to perform argument conversion,
-    # we need to do so ourselves in order to insert a jl_gc_safe_enter|leave
-    # just around the inner ccall
+    function ccall_macro_lower(func, rettype, types, args, nreq)
+        # instead of re-using ccall or Expr(:foreigncall) to perform argument conversion,
+        # we need to do so ourselves in order to insert a jl_gc_safe_enter|leave
+        # just around the inner ccall
 
-    cconvert_exprs = []
-    cconvert_args = []
-    for (typ, arg) in zip(types, args)
-        var = gensym("$(func)_cconvert")
-        push!(cconvert_args, var)
-        push!(cconvert_exprs, :($var = Base.cconvert($(esc(typ)), $(esc(arg)))))
+        cconvert_exprs = []
+        cconvert_args = []
+        for (typ, arg) in zip(types, args)
+            var = gensym("$(func)_cconvert")
+            push!(cconvert_args, var)
+            push!(cconvert_exprs, :($var = Base.cconvert($(esc(typ)), $(esc(arg)))))
+        end
+
+        unsafe_convert_exprs = []
+        unsafe_convert_args = []
+        for (typ, arg) in zip(types, cconvert_args)
+            var = gensym("$(func)_unsafe_convert")
+            push!(unsafe_convert_args, var)
+            push!(unsafe_convert_exprs, :($var = Base.unsafe_convert($(esc(typ)), $arg)))
+        end
+
+        call = quote
+            $(unsafe_convert_exprs...)
+
+            gc_state = @ccall(jl_gc_safe_enter()::Int8)
+            ret = ccall(
+                $(esc(func)), $(esc(rettype)), $(Expr(:tuple, map(esc, types)...)),
+                $(unsafe_convert_args...)
+            )
+            @ccall(jl_gc_safe_leave(gc_state::Int8)::Cvoid)
+            ret
+        end
+
+        return quote
+            @inline
+            $(cconvert_exprs...)
+            GC.@preserve $(cconvert_args...) $(call)
+        end
     end
 
-    unsafe_convert_exprs = []
-    unsafe_convert_args = []
-    for (typ, arg) in zip(types, cconvert_args)
-        var = gensym("$(func)_unsafe_convert")
-        push!(unsafe_convert_args, var)
-        push!(unsafe_convert_exprs, :($var = Base.unsafe_convert($(esc(typ)), $arg)))
+    macro gcsafe_ccall(expr)
+        return ccall_macro_lower(Base.ccall_macro_parse(expr)...)
     end
-
-    call = quote
-        $(unsafe_convert_exprs...)
-
-        gc_state = @ccall(jl_gc_safe_enter()::Int8)
-        ret = ccall(
-            $(esc(func)), $(esc(rettype)), $(Expr(:tuple, map(esc, types)...)),
-            $(unsafe_convert_args...)
-        )
-        @ccall(jl_gc_safe_leave(gc_state::Int8)::Cvoid)
-        ret
-    end
-
-    return quote
-        @inline
-        $(cconvert_exprs...)
-        GC.@preserve $(cconvert_args...) $(call)
-    end
-end
-
-macro gcsafe_ccall(expr)
-    return ccall_macro_lower(Base.ccall_macro_parse(expr)...)
-end
 end # HAS_CCALL_GCSAFE
