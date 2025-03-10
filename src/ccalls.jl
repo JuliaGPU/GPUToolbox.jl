@@ -110,8 +110,8 @@ the Julia directly.
 macro gcsafe_ccall end
 
 if HAS_CCALL_GCSAFE
-    macro gcsafe_ccall(exprs)
-        exprs = pushfirst!(exprs, :(gc_safe = true))
+    macro gcsafe_ccall(expr)
+        exprs = Any[:(gc_safe = true), expr]
         return Base.ccall_macro_lower((:ccall), Base.ccall_macro_parse(exprs)...)
     end
 else
