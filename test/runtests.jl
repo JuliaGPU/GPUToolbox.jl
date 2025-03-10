@@ -1,5 +1,6 @@
 using Test
 using GPUToolbox
+using InteractiveUtils
 
 @testset "GPUToolbox.jl" begin
     @testset "SimpleVersion" begin
