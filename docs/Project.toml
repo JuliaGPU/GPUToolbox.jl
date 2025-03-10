@@ -1,0 +1,10 @@
+[deps]
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+GPUToolbox = "096a3bc2-3ced-46d0-87f4-dd12716f4bfc"
+
+[sources]
+GPUToolbox = {path = ".."}
+
+[compat]
+Documenter = "1.8"
+julia = "1.11"

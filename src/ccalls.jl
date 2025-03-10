@@ -98,9 +98,9 @@ render_arg(io, arg::Base.RefValue{T}) where {T} = print(io, "Ref{", T, "}")
 const HAS_CCALL_GCSAFE = VERSION >= v"1.13.0-DEV.70" || v"1.12-DEV.2029" <= VERSION < v"1.13-"
 
 """
-@gcsafe_ccall ...
+    @gcsafe_ccall ...
 
-Call a foreign function just like `@ccall`, but marking it safe for the GC to run. This is
+Call a foreign function just like [`@ccall`](https://docs.julialang.org/en/v1/base/c/#Base.@ccall), but marking it safe for the GC to run. This is
 useful for functions that may block, so that the GC isn't blocked from running, but may also
 be required to prevent deadlocks (see JuliaGPU/CUDA.jl#2261).
 
