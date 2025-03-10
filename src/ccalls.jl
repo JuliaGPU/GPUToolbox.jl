@@ -95,7 +95,7 @@ render_arg(io, arg::Base.RefValue{T}) where {T} = print(io, "Ref{", T, "}")
 # when callbacks occur, the code should ensure the GC is not running by wrapping the code
 # in the `@gcunsafe` macro
 
-const HAS_CCALL_GCSAFE = VERSION >= v"1.13.0-DEV.70"
+const HAS_CCALL_GCSAFE = VERSION >= v"1.13.0-DEV.70" || v"1.12-DEV.2029" <= VERSION < v"1.13-"
 
 """
 @gcsafe_ccall ...
