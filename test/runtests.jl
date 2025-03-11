@@ -43,6 +43,18 @@ using InteractiveUtils
         @test !(sv2 > sv2) # Default
     end
 
+    @testset "Literals" begin
+        @test 1i8 === Int8(1)
+        @test 1i16 === Int16(1)
+        @test 1i32 === Int32(1)
+        @test_throws InexactError 128i8
+
+        @test 1u8 === UInt8(1)
+        @test 1u16 === UInt16(1)
+        @test 1u32 === UInt32(1)
+        @test_throws InexactError 256u8
+    end
+
     @testset "gcsafe_ccall" begin
         function gc_safe_ccall()
             # jl_rand is marked as JL_NOTSAFEPOINT
