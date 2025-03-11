@@ -14,7 +14,6 @@ One can use the object in suffix form `1*i8` or `1i8` to perform the conversion.
 - `u8`: Convert to `UInt8`
 - `u16`: Convert to `UInt16`
 - `u32`: Convert to `UInt32`
-```
 """
 struct Literal{T} end
 Base.:(*)(x::Number, ::Type{Literal{T}}) where {T} = T(x)
