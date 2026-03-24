@@ -86,6 +86,32 @@ using IOCapture
         end
 
         @test mod.ENUM_VALUE == mod.MY_ENUM_VALUE
+
+        # test with visibility=:export
+        mod_export = @eval module $(gensym())
+            using GPUToolbox
+            @enum MY_ENUM MY_ENUM_A MY_ENUM_B
+            @enum_without_prefix visibility=:export MY_ENUM MY_ENUM_
+        end
+        @test mod_export.A == mod_export.MY_ENUM_A
+        @test mod_export.B == mod_export.MY_ENUM_B
+        exported = names(mod_export)
+        @test :A in exported
+        @test :B in exported
+
+        # test with visibility=:public
+        @static if VERSION >= v"1.11"
+            mod_public = @eval module $(gensym())
+                using GPUToolbox
+                @enum MY_ENUM MY_ENUM_P MY_ENUM_Q
+                @enum_without_prefix visibility=:public MY_ENUM MY_ENUM_
+            end
+            @test mod_public.P == mod_public.MY_ENUM_P
+            @test mod_public.Q == mod_public.MY_ENUM_Q
+            # public but not exported
+            @test :P in names(mod_public)
+            @test !Base.isexported(mod_public, :P)
+        end
     end
 
     @testset "LazyInitialized" begin
