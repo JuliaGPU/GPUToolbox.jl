@@ -1,6 +1,6 @@
 name = "GPUToolbox"
 uuid = "096a3bc2-3ced-46d0-87f4-dd12716f4bfc"
-version = "1.1.0"
+version = "1.1.1"
 
 [deps]
 LLVM = "929cbde3-209d-540e-8aea-75f648917ca0"

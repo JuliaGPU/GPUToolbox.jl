@@ -50,7 +50,9 @@ macro enum_without_prefix(ex...)
         if visibility == :export
             push!(ex.args, :(export $short))
         elseif visibility == :public
-            push!(ex.args, Expr(:public, short))
+            if VERSION >= v"1.11.0-DEV.469"
+                push!(ex.args, Expr(:public, short))
+            end
         end
     end
 
