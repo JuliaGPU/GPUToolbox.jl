@@ -190,6 +190,20 @@ using IOCapture
         @test vec_call_count[] == 1  # Should not increment
         @test test_vec_memo(2) == 6
         @test vec_call_count[] == 2  # Should increment for new index
+
+        # `maxlen` may come from APIs that return smaller integer types.
+        int32_len_call_count = Ref(0)
+        function test_vec_memo_int32_len(x)
+            @memoize x::Int maxlen=Int32(10) begin
+                int32_len_call_count[] += 1
+                x * 4
+            end::Int
+        end
+
+        @test test_vec_memo_int32_len(1) == 4
+        @test int32_len_call_count[] == 1
+        @test test_vec_memo_int32_len(1) == 4
+        @test int32_len_call_count[] == 1
     end
 
     @testset "@memoize concurrency" begin

@@ -50,6 +50,7 @@ Base.@propagate_inbounds @inline function memoize_slot_store!(
 end
 
 function memoize_new_slots(::Type{T}, len) where {T}
+    len = Int(len)
     data = _SlotArray{T}(undef, len)
     for i in eachindex(data)
         memoize_slot_store!(data, i, nothing)
@@ -74,6 +75,7 @@ end
 end
 
 @noinline function memoize_slow!(constructor, m::FixedMemo{T}, key, len) where {T}
+    len = Int(len)
     @static if VERSION >= v"1.11"
         data = memoize_fixed_data!(m, len)
         if data === nothing
