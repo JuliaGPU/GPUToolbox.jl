@@ -1,18 +1,134 @@
 export @memoize
 
+@static if VERSION >= v"1.11"
+    const _SlotArray{T} = AtomicMemory{Union{Nothing,T}}
+else
+    const _SlotArray{T} = Vector{Union{Nothing,T}}
+end
+
+mutable struct FixedMemo{T}
+    @atomic data::Union{Nothing,_SlotArray{T}}
+    const lock::ReentrantLock
+end
+FixedMemo{T}() where {T} = FixedMemo{T}(nothing, ReentrantLock())
+
+mutable struct DictMemo{K,V}
+    dict::Dict{K,V}
+    const lock::ReentrantLock
+end
+DictMemo{K,V}() where {K,V} = DictMemo{K,V}(Dict{K,V}(), ReentrantLock())
+
+@inline memoize_should_publish() = !generating_output() || HAS_FIELD_REPLACE
+
+Base.@propagate_inbounds @inline function memoize_slot_load(data::_SlotArray{T}, key) where {T}
+    @boundscheck checkbounds(data, key)
+    @static if VERSION >= v"1.12"
+        return @inbounds @atomic :acquire data[key]
+    elseif VERSION >= v"1.11"
+        # the `@atomic` macro only gained `AtomicMemory` element access on 1.12;
+        # use the `Core.memoryref*` intrinsics as the bridge on 1.11.
+        ref = Core.memoryrefnew(Core.memoryref(data), Int(key), false)
+        return Core.memoryrefget(ref, :acquire, false)
+    else
+        return @inbounds data[key]
+    end
+end
+
+Base.@propagate_inbounds @inline function memoize_slot_store!(
+    data::_SlotArray{T}, key, val::Union{Nothing,T}
+) where {T}
+    @boundscheck checkbounds(data, key)
+    @static if VERSION >= v"1.12"
+        @inbounds @atomic :release data[key] = val
+    elseif VERSION >= v"1.11"
+        ref = Core.memoryrefnew(Core.memoryref(data), Int(key), false)
+        Core.memoryrefset!(ref, val, :release, false)
+    else
+        @inbounds data[key] = val
+    end
+    return val
+end
+
+function memoize_new_slots(::Type{T}, len) where {T}
+    data = _SlotArray{T}(undef, len)
+    for i in eachindex(data)
+        memoize_slot_store!(data, i, nothing)
+    end
+    return data
+end
+
+@noinline function memoize_fixed_data!(m::FixedMemo{T}, len) where {T}
+    data = @atomic :acquire m.data
+    data !== nothing && return data
+    memoize_should_publish() || return nothing
+
+    @lock m.lock begin
+        data = @atomic :acquire m.data
+        if data === nothing
+            data = memoize_new_slots(T, len)
+            generating_output() && wipe_on_serialize!(m, :data, nothing)
+            @atomic :release m.data = data
+        end
+        return data
+    end
+end
+
+@noinline function memoize_slow!(constructor, m::FixedMemo{T}, key, len) where {T}
+    @static if VERSION >= v"1.11"
+        data = memoize_fixed_data!(m, len)
+        if data === nothing
+            checkbounds(1:len, key)
+            return constructor()::T
+        end
+
+        cached = memoize_slot_load(data, key)
+        cached !== nothing && return cached::T
+
+        val = constructor()::T
+        if memoize_should_publish()
+            generating_output() && wipe_on_serialize!(m, :data, nothing)
+            memoize_slot_store!(data, key, val)
+        end
+        return val
+    else
+        @lock m.lock begin
+            data = @atomic :acquire m.data
+            if data === nothing
+                if !memoize_should_publish()
+                    checkbounds(1:len, key)
+                    return constructor()::T
+                end
+                data = memoize_new_slots(T, len)
+                generating_output() && wipe_on_serialize!(m, :data, nothing)
+                @atomic :release m.data = data
+            end
+
+            cached = memoize_slot_load(data, key)
+            cached !== nothing && return cached::T
+
+            val = constructor()::T
+            if memoize_should_publish()
+                generating_output() && wipe_on_serialize!(m, :data, nothing)
+                memoize_slot_store!(data, key, val)
+            end
+            return val
+        end
+    end
+end
+
 """
     @memoize [key::T] [maxlen=...] begin
         # expensive computation
     end::T
 
-Low-level, no-frills memoization macro that stores values in a thread-local, typed cache.
+Low-level, no-frills memoization macro that stores values in a process-local, typed cache.
 The types of the caches are derived from the syntactical type assertions.
 
-The cache consists of two levels, the outer one indexed with the thread index. If no `key`
-is specified, the second level of the cache is dropped.
-
-If the the `maxlen` option is specified, the `key` is assumed to be an  integer, and the
-secondary cache will be a vector with length `maxlen`. Otherwise, a dictionary is used.
+If the `maxlen` option is specified, the `key` is assumed to be an integer, and the
+cache will be a fixed-size array with length `maxlen`. Otherwise, a dictionary is used.
+On Julia 1.11+, fixed-size slots use atomic per-element access. Atomic slot access is
+lock-free for pointer-representable values; other values may use Julia's internal
+per-element atomic fallback.
 """
 macro memoize(ex...)
     code = ex[end]
@@ -36,81 +152,127 @@ macro memoize(ex...)
         options[arg.args[1]] = arg.args[2]
     end
 
-    # the global cache is an array with one entry per thread. if we don't have to key on
-    # anything, that entry will be the memoized new_value, or else a dictionary of values.
     @gensym global_cache
+    mod = @__MODULE__
+    lazy_ty = GlobalRef(mod, :LazyInitialized)
+    fixed_ty = GlobalRef(mod, :FixedMemo)
+    dict_ty = GlobalRef(mod, :DictMemo)
+    slot_load = GlobalRef(mod, :memoize_slot_load)
+    slot_store = GlobalRef(mod, :memoize_slot_store!)
+    new_slots = GlobalRef(mod, :memoize_new_slots)
+    fixed_slow = GlobalRef(mod, :memoize_slow!)
+    should_publish = GlobalRef(mod, :memoize_should_publish)
+    generating = GlobalRef(mod, :generating_output)
+    wipe = GlobalRef(mod, :wipe_on_serialize!)
 
-    # in the presence of thread adoption, we need to use the maximum thread ID
-    nthreads = :( Threads.maxthreadid() )
+    rettyp_esc = esc(rettyp)
+    code_esc = esc(code)
 
-    # generate code to access memoized values
-    # (assuming the global_cache can be indexed with the thread ID)
     if key === nothing
-        # if we don't have to key on anything, use the global cache directly
-        global_cache_eltyp = :(Union{Nothing,$rettyp})
+        @eval __module__ begin
+            const $global_cache = $lazy_ty{$rettyp}()
+        end
+
         ex = quote
-            cache = get!($(esc(global_cache))) do
-                $global_cache_eltyp[nothing for _ in 1:$nthreads]
-            end
-            cached_value = @inbounds cache[Threads.threadid()]
-            if cached_value !== nothing
-                cached_value
-            else
-                new_value = $(esc(code))::$rettyp
-                @inbounds cache[Threads.threadid()] = new_value
-                new_value
+            let cache = $(esc(global_cache))
+                val = @atomic :acquire cache.value
+                if val !== nothing
+                    val::$rettyp_esc
+                else
+                    Base.get!(cache) do
+                        $code_esc::$rettyp_esc
+                    end
+                end
             end
         end
     elseif haskey(options, :maxlen)
-        # if we know the length of the cache, use a fixed-size array
-        global_cache_eltyp = :(Vector{Union{Nothing,$rettyp}})
-        global_init = :(Union{Nothing,$rettyp}[nothing for _ in 1:$(esc(options[:maxlen]))])
+        @eval __module__ begin
+            const $global_cache = $fixed_ty{$rettyp}()
+        end
+
+        key_val_esc = esc(key.val)
+        maxlen_esc = esc(options[:maxlen])
         ex = quote
-            cache = get!($(esc(global_cache))) do
-                $global_cache_eltyp[$global_init for _ in 1:$nthreads]
-            end
-            local_cache = @inbounds begin
-                tid = Threads.threadid()
-                assume(isassigned(cache, tid))
-                cache[tid]
-            end
-            cached_value = @inbounds local_cache[$(esc(key.val))]
-            if cached_value !== nothing
-                cached_value
-            else
-                new_value = $(esc(code))::$rettyp
-                @inbounds local_cache[$(esc(key.val))] = new_value
-                new_value
+            let cache = $(esc(global_cache)), key = $key_val_esc
+                @static if VERSION >= v"1.11"
+                    data = @atomic :acquire cache.data
+                    if data !== nothing
+                        cached_value = $slot_load(data, key)
+                        if cached_value !== nothing
+                            cached_value::$rettyp_esc
+                        else
+                            $fixed_slow(cache, key, $maxlen_esc) do
+                                $code_esc::$rettyp_esc
+                            end
+                        end
+                    else
+                        $fixed_slow(cache, key, $maxlen_esc) do
+                            $code_esc::$rettyp_esc
+                        end
+                    end
+                else
+                    @lock cache.lock begin
+                        len = $maxlen_esc
+                        publish = $should_publish()
+                        data = @atomic :acquire cache.data
+                        if data === nothing
+                            if !publish
+                                checkbounds(1:len, key)
+                                $code_esc::$rettyp_esc
+                            else
+                                data = $new_slots($rettyp_esc, len)
+                                $generating() && $wipe(cache, :data, nothing)
+                                @atomic :release cache.data = data
+
+                                cached_value = $slot_load(data, key)
+                                if cached_value !== nothing
+                                    cached_value::$rettyp_esc
+                                else
+                                    new_value = $code_esc::$rettyp_esc
+                                    $generating() && $wipe(cache, :data, nothing)
+                                    $slot_store(data, key, new_value)
+                                    new_value
+                                end
+                            end
+                        else
+                            cached_value = $slot_load(data, key)
+                            if cached_value !== nothing
+                                cached_value::$rettyp_esc
+                            else
+                                new_value = $code_esc::$rettyp_esc
+                                if publish
+                                    $generating() && $wipe(cache, :data, nothing)
+                                    $slot_store(data, key, new_value)
+                                end
+                                new_value
+                            end
+                        end
+                    end
+                end
             end
         end
     else
-        # otherwise, fall back to a dictionary
-        global_cache_eltyp = :(Dict{$(key.typ),$rettyp})
-        global_init = :(Dict{$(key.typ),$rettyp}())
-        ex = quote
-            cache = get!($(esc(global_cache))) do
-                $global_cache_eltyp[$global_init for _ in 1:$nthreads]
-            end
-            local_cache = @inbounds begin
-                tid = Threads.threadid()
-                assume(isassigned(cache, tid))
-                cache[tid]
-            end
-            cached_value = get(local_cache, $(esc(key.val)), nothing)
-            if cached_value !== nothing
-                cached_value
-            else
-                new_value = $(esc(code))::$rettyp
-                local_cache[$(esc(key.val))] = new_value
-                new_value
-            end
+        @eval __module__ begin
+            const $global_cache = $dict_ty{$(key.typ),$rettyp}()
         end
-    end
 
-    # define the per-thread cache
-    @eval __module__ begin
-        const $global_cache = LazyInitialized{Vector{$(global_cache_eltyp)}}() do cache
-            length(cache) == $nthreads
+        key_val_esc = esc(key.val)
+        ex = quote
+            let cache = $(esc(global_cache)), key = $key_val_esc
+                @lock cache.lock begin
+                    dict = cache.dict
+                    if haskey(dict, key)
+                        dict[key]::$rettyp_esc
+                    else
+                        new_value = $code_esc::$rettyp_esc
+                        if $should_publish()
+                            $generating() && $wipe(cache, :dict, empty(dict))
+                            dict[key] = new_value
+                        end
+                        new_value
+                    end
+                end
+            end
         end
     end
 
