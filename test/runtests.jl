@@ -126,21 +126,22 @@ using IOCapture
             error("Should not be called")
         end == 42
 
-        # Test with validator
-        valid = Ref(true)
-        lazy_with_validator = LazyInitialized{Int}() do val
-            valid[]
+    end
+
+    @testset "LazyInitialized concurrency" begin
+        init_count = Threads.Atomic{Int}(0)
+        lazy = LazyInitialized{NTuple{4,Int}}()
+
+        function build_tuple()
+            id = Threads.atomic_add!(init_count, 1) + 1
+            yield()
+            return ntuple(Returns(id), 4)
         end
-        @test get!(lazy_with_validator) do
-            1
-        end == 1
-        @test get!(lazy_with_validator) do
-            2
-        end == 1
-        valid[] = false
-        @test get!(lazy_with_validator) do
-            3
-        end == 3
+
+        tasks = [Threads.@spawn get!(build_tuple, lazy) for _ in 1:128]
+        results = fetch.(tasks)
+        @test init_count[] == 1
+        @test all(==((1, 1, 1, 1)), results)
     end
 
     @testset "@memoize" begin
@@ -189,6 +190,149 @@ using IOCapture
         @test vec_call_count[] == 1  # Should not increment
         @test test_vec_memo(2) == 6
         @test vec_call_count[] == 2  # Should increment for new index
+
+        # `maxlen` may come from APIs that return smaller integer types.
+        int32_len_call_count = Ref(0)
+        function test_vec_memo_int32_len(x)
+            @memoize x::Int maxlen=Int32(10) begin
+                int32_len_call_count[] += 1
+                x * 4
+            end::Int
+        end
+
+        @test test_vec_memo_int32_len(1) == 4
+        @test int32_len_call_count[] == 1
+        @test test_vec_memo_int32_len(1) == 4
+        @test int32_len_call_count[] == 1
+    end
+
+    @testset "@memoize concurrency" begin
+        no_key_count = Threads.Atomic{Int}(0)
+        function memo_no_key_stress()
+            @memoize begin
+                Threads.atomic_add!(no_key_count, 1)
+                yield()
+                1234
+            end::Int
+        end
+
+        tasks = [Threads.@spawn memo_no_key_stress() for _ in 1:128]
+        @test all(==(1234), fetch.(tasks))
+        @test no_key_count[] == 1
+
+        dict_count = Threads.Atomic{Int}(0)
+        function memo_dict_stress(x)
+            @memoize x::Int begin
+                Threads.atomic_add!(dict_count, 1)
+                yield()
+                x * 10
+            end::Int
+        end
+
+        keys = [mod1(i, 16) for i in 1:256]
+        tasks = [Threads.@spawn memo_dict_stress(key) for key in keys]
+        @test fetch.(tasks) == keys .* 10
+        @test dict_count[] == 16
+
+        fixed_count = Threads.Atomic{Int}(0)
+        function memo_fixed_stress(x)
+            @memoize x::Int maxlen=16 begin
+                Threads.atomic_add!(fixed_count, 1)
+                yield()
+                x * 20
+            end::Int
+        end
+
+        tasks = [Threads.@spawn memo_fixed_stress(key) for key in keys]
+        @test fetch.(tasks) == keys .* 20
+        @test 16 <= fixed_count[] <= length(keys)
+
+        fixed_count_after_warmup = fixed_count[]
+        tasks = [Threads.@spawn memo_fixed_stress(key) for key in keys]
+        @test fetch.(tasks) == keys .* 20
+        @test fixed_count[] == fixed_count_after_warmup
+    end
+
+    @testset "Session-safe caches" begin
+        mktempdir() do dir
+            probe_dir = joinpath(dir, "MemoSessionProbe")
+            src_dir = joinpath(probe_dir, "src")
+            mkpath(src_dir)
+
+            write(joinpath(probe_dir, "Project.toml"), """
+            name = "MemoSessionProbe"
+            uuid = "5c47f73b-ac9c-4df8-9db3-37f1345bcb51"
+            version = "0.1.0"
+
+            [deps]
+            Pkg = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"
+            """)
+
+            write(joinpath(src_dir, "MemoSessionProbe.jl"), """
+            module MemoSessionProbe
+
+            using GPUToolbox
+
+            const PRECOMPILE = Ref((0, 0, 0, 0))
+            const LAZY = LazyInitialized{Int}()
+
+            lazy_pid() = get!(() -> Int(getpid()), LAZY)
+
+            function memo_no_key_pid()
+                @memoize begin
+                    Int(getpid())
+                end::Int
+            end
+
+            function memo_fixed_pid(key)
+                @memoize key::Int maxlen=2 begin
+                    Int(getpid())
+                end::Int
+            end
+
+            function memo_dict_pid(key)
+                @memoize key::Int begin
+                    Int(getpid())
+                end::Int
+            end
+
+            runtime_values() =
+                (lazy_pid(), memo_no_key_pid(), memo_fixed_pid(1), memo_dict_pid(1))
+
+            if ccall(:jl_generating_output, Cint, ()) != 0
+                PRECOMPILE[] = runtime_values()
+            end
+
+            end
+            """)
+
+            julia = joinpath(Sys.BINDIR, Base.julia_exename())
+            toolbox_path = pkgdir(GPUToolbox)
+            setup = """
+            using Pkg
+            Pkg.develop(PackageSpec(path=$(repr(toolbox_path))))
+            Pkg.instantiate()
+            using MemoSessionProbe
+            """
+            run(Cmd([julia, "--startup-file=no", "--project=$probe_dir", "-e", setup]))
+
+            check = """
+            using MemoSessionProbe
+            pre = MemoSessionProbe.PRECOMPILE[]
+            vals = MemoSessionProbe.runtime_values()
+            println("RESULT ", join((pre..., vals..., Int(getpid())), ","))
+            """
+            out = read(Cmd([julia, "--startup-file=no", "--project=$probe_dir", "-e", check]), String)
+            line = only(filter(startswith("RESULT "), split(out, '\n')))
+            nums = parse.(Int, split(chop(line; head=7, tail=0), ","))
+            precompile_vals = nums[1:4]
+            runtime_vals = nums[5:8]
+            runtime_pid = nums[9]
+
+            @test all(!=(0), precompile_vals)
+            @test all(==(runtime_pid), runtime_vals)
+            @test all(!=(runtime_pid), precompile_vals)
+        end
     end
 
     @testset "@checked" begin

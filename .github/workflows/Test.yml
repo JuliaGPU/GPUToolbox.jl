@@ -18,14 +18,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ['lts', '1.11', 'nightly']
-        os: [ubuntu-latest, macOS-13, windows-latest]
+        version: ['lts', '1', 'nightly']
+        os: [ubuntu-latest, windows-latest]
         arch: [x64]
         include:
           - version: 'lts'
             os: 'macOS-latest'
             arch: 'aarch64'
-          - version: '1.11'
+          - version: '1'
             os: 'macOS-latest'
             arch: 'aarch64'
           - version: 'nightly'
