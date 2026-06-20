@@ -187,7 +187,7 @@ using IOCapture
         # Test memoization with key (dictionary)
         dict_call_count = Ref(0)
         function test_dict_memo(x)
-            @memoize x::Int begin
+            @memoize key=x::Int begin
                 dict_call_count[] += 1
                 x * 2
             end::Int
@@ -202,7 +202,7 @@ using IOCapture
 
         dict_nothing_call_count = Ref(0)
         function test_dict_nothing_memo(x)
-            @memoize x::Int begin
+            @memoize key=x::Int begin
                 dict_nothing_call_count[] += 1
                 nothing
             end::Union{Nothing,Int}
@@ -215,50 +215,81 @@ using IOCapture
         @test test_dict_nothing_memo(3) === nothing
         @test dict_nothing_call_count[] == 2
 
-        # Test memoization with maxlen (vector)
-        vec_call_count = Ref(0)
-        function test_vec_memo(x)
-            @memoize x::Int maxlen=10 begin
-                vec_call_count[] += 1
+        # Test memoization with index (auto-growing array)
+        index_call_count = Ref(0)
+        function test_index_memo(x)
+            @memoize index=x begin
+                index_call_count[] += 1
                 x * 3
             end::Int
         end
 
-        @test test_vec_memo(1) == 3
-        @test vec_call_count[] == 1
-        @test test_vec_memo(1) == 3
-        @test vec_call_count[] == 1  # Should not increment
-        @test test_vec_memo(2) == 6
-        @test vec_call_count[] == 2  # Should increment for new index
+        @test test_index_memo(1) == 3
+        @test index_call_count[] == 1
+        @test test_index_memo(1) == 3
+        @test index_call_count[] == 1  # Should not increment
+        @test test_index_memo(2) == 6
+        @test index_call_count[] == 2  # Should increment for new index
 
-        vec_nothing_call_count = Ref(0)
-        function test_vec_nothing_memo(x)
-            @memoize x::Int maxlen=10 begin
-                vec_nothing_call_count[] += 1
+        index_nothing_call_count = Ref(0)
+        function test_index_nothing_memo(x)
+            @memoize index=x begin
+                index_nothing_call_count[] += 1
                 nothing
             end::Union{Nothing,Int}
         end
 
-        @test test_vec_nothing_memo(1) === nothing
-        @test vec_nothing_call_count[] == 1
-        @test test_vec_nothing_memo(1) === nothing
-        @test vec_nothing_call_count[] == 1
-        @test test_vec_nothing_memo(2) === nothing
-        @test vec_nothing_call_count[] == 2
+        @test test_index_nothing_memo(1) === nothing
+        @test index_nothing_call_count[] == 1
+        @test test_index_nothing_memo(1) === nothing
+        @test index_nothing_call_count[] == 1
+        @test test_index_nothing_memo(2) === nothing
+        @test index_nothing_call_count[] == 2
 
-        # `maxlen` may come from APIs that return smaller integer types.
-        int32_len_call_count = Ref(0)
-        function test_vec_memo_int32_len(x)
-            @memoize x::Int maxlen=Int32(10) begin
-                int32_len_call_count[] += 1
-                x * 4
+        # `index` may come from APIs that return smaller integer types.
+        int32_index_call_count = Ref(0)
+        function test_index_memo_int32_index(x)
+            @memoize index=x begin
+                int32_index_call_count[] += 1
+                Int(x) * 4
             end::Int
         end
 
-        @test test_vec_memo_int32_len(1) == 4
-        @test int32_len_call_count[] == 1
-        @test test_vec_memo_int32_len(1) == 4
-        @test int32_len_call_count[] == 1
+        @test test_index_memo_int32_index(Int32(1)) == 4
+        @test int32_index_call_count[] == 1
+        @test test_index_memo_int32_index(Int32(1)) == 4
+        @test int32_index_call_count[] == 1
+
+        grow_counts = zeros(Int, 12)
+        function test_index_grow(x)
+            @memoize index=x begin
+                grow_counts[x] += 1
+                x + 100
+            end::Int
+        end
+
+        @test [test_index_grow(i) for i in 1:12] == collect(101:112)
+        @test [test_index_grow(i) for i in 1:12] == collect(101:112)
+        @test all(==(1), grow_counts)
+
+        bad_index_call_count = Ref(0)
+        function test_bad_index_memo(x)
+            @memoize index=x begin
+                bad_index_call_count[] += 1
+                x
+            end::Int
+        end
+
+        @test_throws BoundsError test_bad_index_memo(0)
+        @test_throws BoundsError test_bad_index_memo(-1)
+        @test bad_index_call_count[] == 0
+
+        @test_throws ArgumentError macroexpand(
+            @__MODULE__, :(@memoize x::Int begin x end::Int)
+        )
+        @test_throws ArgumentError macroexpand(
+            @__MODULE__, :(@memoize maxlen=2 begin 1 end::Int)
+        )
     end
 
     @testset "@memoize concurrency" begin
@@ -277,7 +308,7 @@ using IOCapture
 
         dict_count = Threads.Atomic{Int}(0)
         function memo_dict_stress(x)
-            @memoize x::Int begin
+            @memoize key=x::Int begin
                 Threads.atomic_add!(dict_count, 1)
                 yield()
                 x * 10
@@ -289,23 +320,38 @@ using IOCapture
         @test fetch.(tasks) == keys .* 10
         @test dict_count[] == 16
 
-        fixed_count = Threads.Atomic{Int}(0)
-        function memo_fixed_stress(x)
-            @memoize x::Int maxlen=16 begin
-                Threads.atomic_add!(fixed_count, 1)
+        index_count = Threads.Atomic{Int}(0)
+        function memo_index_stress(x)
+            @memoize index=x begin
+                Threads.atomic_add!(index_count, 1)
                 yield()
                 x * 20
             end::Int
         end
 
-        tasks = [Threads.@spawn memo_fixed_stress(key) for key in keys]
+        tasks = [Threads.@spawn memo_index_stress(key) for key in keys]
         @test fetch.(tasks) == keys .* 20
-        @test 16 <= fixed_count[] <= length(keys)
+        @test index_count[] == 16
 
-        fixed_count_after_warmup = fixed_count[]
-        tasks = [Threads.@spawn memo_fixed_stress(key) for key in keys]
+        index_count_after_warmup = index_count[]
+        tasks = [Threads.@spawn memo_index_stress(key) for key in keys]
         @test fetch.(tasks) == keys .* 20
-        @test fixed_count[] == fixed_count_after_warmup
+        @test index_count[] == index_count_after_warmup
+
+        grow_race_count = Threads.Atomic{Int}(0)
+        function memo_index_grow_race(x)
+            @memoize index=x begin
+                Threads.atomic_add!(grow_race_count, 1)
+                yield()
+                x * 30
+            end::Int
+        end
+
+        @test memo_index_grow_race(1) == 30
+        @test grow_race_count[] == 1
+        tasks = [Threads.@spawn memo_index_grow_race(64) for _ in 1:128]
+        @test all(==(64 * 30), fetch.(tasks))
+        @test grow_race_count[] == 2
     end
 
     @testset "Session-safe caches" begin
@@ -339,23 +385,26 @@ using IOCapture
                 end::Int
             end
 
-            function memo_fixed_pid(key)
-                @memoize key::Int maxlen=2 begin
+            function memo_index_pid(key)
+                @memoize index=key begin
                     Int(getpid())
                 end::Int
             end
 
             function memo_dict_pid(key)
-                @memoize key::Int begin
+                @memoize key=key::Int begin
                     Int(getpid())
                 end::Int
             end
 
+            precompile_values() =
+                (lazy_pid(), memo_no_key_pid(), memo_index_pid(1), memo_dict_pid(1))
+
             runtime_values() =
-                (lazy_pid(), memo_no_key_pid(), memo_fixed_pid(1), memo_dict_pid(1))
+                (lazy_pid(), memo_no_key_pid(), memo_index_pid(1), memo_index_pid(4), memo_dict_pid(1))
 
             if ccall(:jl_generating_output, Cint, ()) != 0
-                PRECOMPILE[] = runtime_values()
+                PRECOMPILE[] = precompile_values()
             end
 
             end
@@ -381,8 +430,8 @@ using IOCapture
             line = only(filter(startswith("RESULT "), split(out, '\n')))
             nums = parse.(Int, split(chop(line; head=7, tail=0), ","))
             precompile_vals = nums[1:4]
-            runtime_vals = nums[5:8]
-            runtime_pid = nums[9]
+            runtime_vals = nums[5:9]
+            runtime_pid = nums[10]
 
             @test all(!=(0), precompile_vals)
             @test all(==(runtime_pid), runtime_vals)
