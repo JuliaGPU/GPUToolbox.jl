@@ -209,7 +209,8 @@ macro memoize(ex...)
                 @static if VERSION >= v"1.11"
                     data = @atomic :acquire cache.data
                     if data !== nothing && 1 <= key <= length(data)
-                        cached_value = $slot_load(data, key)
+                        # bounds already checked above; skip the redundant check
+                        cached_value = @inbounds $slot_load(data, key)
                         if cached_value !== nothing
                             Base.something(cached_value)::$rettyp_esc
                         else
