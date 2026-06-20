@@ -20,11 +20,11 @@ value by calling `get!`. The constructor is ensured to only be called once.
 This type is intended for lazy initialization of e.g. global structures, without using
 `__init__`. It is similar to protecting accesses using a lock, but is much cheaper.
 
-The initialized value must not be `nothing`.
+Any value of type `T`, including `nothing` when allowed by `T`, may be stored.
 
 """
 mutable struct LazyInitialized{T}
-    @atomic value::Union{Nothing,T}
+    @atomic value::Union{Nothing,Some{T}}
     const lock::ReentrantLock
 end
 
@@ -32,7 +32,7 @@ LazyInitialized{T}() where {T} = LazyInitialized{T}(nothing, ReentrantLock())
 
 @inline function Base.get!(constructor::Base.Callable, x::LazyInitialized{T}) where {T}
     val = @atomic :acquire x.value
-    val !== nothing && return val::T
+    val !== nothing && return Base.something(val)::T
     return slow_init!(constructor, x)::T
 end
 
@@ -43,10 +43,10 @@ end
 
     @lock x.lock begin
         val = @atomic :acquire x.value
-        val !== nothing && return val::T
-        val = constructor()::T
+        val !== nothing && return Base.something(val)::T
+        result = constructor()::T
         generating_output() && wipe_on_serialize!(x, :value, nothing)
-        @atomic :release x.value = val
-        return val
+        @atomic :release x.value = Some{T}(result)
+        return result
     end
 end

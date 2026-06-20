@@ -1,9 +1,9 @@
 export @memoize
 
 @static if VERSION >= v"1.11"
-    const _SlotArray{T} = AtomicMemory{Union{Nothing,T}}
+    const _SlotArray{T} = AtomicMemory{Union{Nothing,Some{T}}}
 else
-    const _SlotArray{T} = Vector{Union{Nothing,T}}
+    const _SlotArray{T} = Vector{Union{Nothing,Some{T}}}
 end
 
 mutable struct FixedMemo{T}
@@ -35,7 +35,7 @@ Base.@propagate_inbounds @inline function memoize_slot_load(data::_SlotArray{T},
 end
 
 Base.@propagate_inbounds @inline function memoize_slot_store!(
-    data::_SlotArray{T}, key, val::Union{Nothing,T}
+    data::_SlotArray{T}, key, val::Union{Nothing,Some{T}}
 ) where {T}
     @boundscheck checkbounds(data, key)
     @static if VERSION >= v"1.12"
@@ -84,12 +84,12 @@ end
         end
 
         cached = memoize_slot_load(data, key)
-        cached !== nothing && return cached::T
+        cached !== nothing && return Base.something(cached)::T
 
         val = constructor()::T
         if memoize_should_publish()
             generating_output() && wipe_on_serialize!(m, :data, nothing)
-            memoize_slot_store!(data, key, val)
+            memoize_slot_store!(data, key, Some{T}(val))
         end
         return val
     else
@@ -106,12 +106,12 @@ end
             end
 
             cached = memoize_slot_load(data, key)
-            cached !== nothing && return cached::T
+            cached !== nothing && return Base.something(cached)::T
 
             val = constructor()::T
             if memoize_should_publish()
                 generating_output() && wipe_on_serialize!(m, :data, nothing)
-                memoize_slot_store!(data, key, val)
+                memoize_slot_store!(data, key, Some{T}(val))
             end
             return val
         end
@@ -125,6 +125,7 @@ end
 
 Low-level, no-frills memoization macro that stores values in a process-local, typed cache.
 The types of the caches are derived from the syntactical type assertions.
+All return values, including `nothing`, are memoized correctly.
 
 If the `maxlen` option is specified, the `key` is assumed to be an integer, and the
 cache will be a fixed-size array with length `maxlen`. Otherwise, a dictionary is used.
@@ -179,7 +180,7 @@ macro memoize(ex...)
             let cache = $(esc(global_cache))
                 val = @atomic :acquire cache.value
                 if val !== nothing
-                    val::$rettyp_esc
+                    Base.something(val)::$rettyp_esc
                 else
                     Base.get!(cache) do
                         $code_esc::$rettyp_esc
@@ -201,7 +202,7 @@ macro memoize(ex...)
                     if data !== nothing
                         cached_value = $slot_load(data, key)
                         if cached_value !== nothing
-                            cached_value::$rettyp_esc
+                            Base.something(cached_value)::$rettyp_esc
                         else
                             $fixed_slow(cache, key, $maxlen_esc) do
                                 $code_esc::$rettyp_esc
@@ -228,23 +229,23 @@ macro memoize(ex...)
 
                                 cached_value = $slot_load(data, key)
                                 if cached_value !== nothing
-                                    cached_value::$rettyp_esc
+                                    Base.something(cached_value)::$rettyp_esc
                                 else
                                     new_value = $code_esc::$rettyp_esc
                                     $generating() && $wipe(cache, :data, nothing)
-                                    $slot_store(data, key, new_value)
+                                    $slot_store(data, key, Base.Some{$rettyp_esc}(new_value))
                                     new_value
                                 end
                             end
                         else
                             cached_value = $slot_load(data, key)
                             if cached_value !== nothing
-                                cached_value::$rettyp_esc
+                                Base.something(cached_value)::$rettyp_esc
                             else
                                 new_value = $code_esc::$rettyp_esc
                                 if publish
                                     $generating() && $wipe(cache, :data, nothing)
-                                    $slot_store(data, key, new_value)
+                                    $slot_store(data, key, Base.Some{$rettyp_esc}(new_value))
                                 end
                                 new_value
                             end
