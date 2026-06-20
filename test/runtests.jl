@@ -126,6 +126,18 @@ using IOCapture
             error("Should not be called")
         end == 42
 
+        nothing_count = Ref(0)
+        lazy_nothing = LazyInitialized{Union{Nothing,Int}}()
+        @test get!(lazy_nothing) do
+            nothing_count[] += 1
+            nothing
+        end === nothing
+        @test nothing_count[] == 1
+        @test get!(lazy_nothing) do
+            error("Should not be called")
+        end === nothing
+        @test nothing_count[] == 1
+
     end
 
     @testset "LazyInitialized concurrency" begin
@@ -159,6 +171,19 @@ using IOCapture
         @test test_basic_memo() == 42
         @test call_count[] == 1  # Should not increment
 
+        nothing_call_count = Ref(0)
+        function test_no_key_nothing_memo()
+            @memoize begin
+                nothing_call_count[] += 1
+                nothing
+            end::Union{Nothing,Int}
+        end
+
+        @test test_no_key_nothing_memo() === nothing
+        @test nothing_call_count[] == 1
+        @test test_no_key_nothing_memo() === nothing
+        @test nothing_call_count[] == 1
+
         # Test memoization with key (dictionary)
         dict_call_count = Ref(0)
         function test_dict_memo(x)
@@ -175,6 +200,21 @@ using IOCapture
         @test test_dict_memo(3) == 6
         @test dict_call_count[] == 2  # Should increment for new key
 
+        dict_nothing_call_count = Ref(0)
+        function test_dict_nothing_memo(x)
+            @memoize x::Int begin
+                dict_nothing_call_count[] += 1
+                nothing
+            end::Union{Nothing,Int}
+        end
+
+        @test test_dict_nothing_memo(5) === nothing
+        @test dict_nothing_call_count[] == 1
+        @test test_dict_nothing_memo(5) === nothing
+        @test dict_nothing_call_count[] == 1
+        @test test_dict_nothing_memo(3) === nothing
+        @test dict_nothing_call_count[] == 2
+
         # Test memoization with maxlen (vector)
         vec_call_count = Ref(0)
         function test_vec_memo(x)
@@ -190,6 +230,21 @@ using IOCapture
         @test vec_call_count[] == 1  # Should not increment
         @test test_vec_memo(2) == 6
         @test vec_call_count[] == 2  # Should increment for new index
+
+        vec_nothing_call_count = Ref(0)
+        function test_vec_nothing_memo(x)
+            @memoize x::Int maxlen=10 begin
+                vec_nothing_call_count[] += 1
+                nothing
+            end::Union{Nothing,Int}
+        end
+
+        @test test_vec_nothing_memo(1) === nothing
+        @test vec_nothing_call_count[] == 1
+        @test test_vec_nothing_memo(1) === nothing
+        @test vec_nothing_call_count[] == 1
+        @test test_vec_nothing_memo(2) === nothing
+        @test vec_nothing_call_count[] == 2
 
         # `maxlen` may come from APIs that return smaller integer types.
         int32_len_call_count = Ref(0)
