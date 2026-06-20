@@ -49,77 +49,60 @@ Base.@propagate_inbounds @inline function memoize_slot_store!(
     return val
 end
 
-function memoize_new_slots(::Type{T}, len) where {T}
-    len = Int(len)
-    data = _SlotArray{T}(undef, len)
-    for i in eachindex(data)
+@inline memoize_grow_len(oldlen::Int, key::Int) = max(key, 2 * oldlen)
+
+function memoize_grow_slots(::Type{T}, old::Union{Nothing,_SlotArray{T}}, newlen) where {T}
+    newlen = Int(newlen)
+    data = _SlotArray{T}(undef, newlen)
+    n = old === nothing ? 0 : length(old)
+    @inbounds for i in 1:n
+        memoize_slot_store!(data, i, memoize_slot_load(old, i))
+    end
+    @inbounds for i in (n + 1):newlen
         memoize_slot_store!(data, i, nothing)
     end
     return data
 end
 
-@noinline function memoize_fixed_data!(m::FixedMemo{T}, len) where {T}
-    data = @atomic :acquire m.data
-    data !== nothing && return data
-    memoize_should_publish() || return nothing
+@noinline function memoize_grow_slow!(constructor, m::FixedMemo{T}, key) where {T}
+    key = Int(key)
+    key >= 1 || throw(BoundsError())
+    memoize_should_publish() || return constructor()::T
 
     @lock m.lock begin
         data = @atomic :acquire m.data
         if data === nothing
-            data = memoize_new_slots(T, len)
+            data = memoize_grow_slots(T, nothing, memoize_grow_len(0, key))
             generating_output() && wipe_on_serialize!(m, :data, nothing)
             @atomic :release m.data = data
-        end
-        return data
-    end
-end
-
-@noinline function memoize_slow!(constructor, m::FixedMemo{T}, key, len) where {T}
-    len = Int(len)
-    @static if VERSION >= v"1.11"
-        data = memoize_fixed_data!(m, len)
-        if data === nothing
-            checkbounds(1:len, key)
-            return constructor()::T
+        elseif key > length(data)
+            oldlen = length(data)
+            newlen = memoize_grow_len(oldlen, key)
+            @static if VERSION >= v"1.11"
+                data = memoize_grow_slots(T, data, newlen)
+                generating_output() && wipe_on_serialize!(m, :data, nothing)
+                @atomic :release m.data = data
+            else
+                generating_output() && wipe_on_serialize!(m, :data, nothing)
+                resize!(data, newlen)
+                @inbounds for i in (oldlen + 1):newlen
+                    memoize_slot_store!(data, i, nothing)
+                end
+            end
         end
 
         cached = memoize_slot_load(data, key)
         cached !== nothing && return Base.something(cached)::T
 
         val = constructor()::T
-        if memoize_should_publish()
-            generating_output() && wipe_on_serialize!(m, :data, nothing)
-            memoize_slot_store!(data, key, Some{T}(val))
-        end
+        generating_output() && wipe_on_serialize!(m, :data, nothing)
+        memoize_slot_store!(data, key, Some{T}(val))
         return val
-    else
-        @lock m.lock begin
-            data = @atomic :acquire m.data
-            if data === nothing
-                if !memoize_should_publish()
-                    checkbounds(1:len, key)
-                    return constructor()::T
-                end
-                data = memoize_new_slots(T, len)
-                generating_output() && wipe_on_serialize!(m, :data, nothing)
-                @atomic :release m.data = data
-            end
-
-            cached = memoize_slot_load(data, key)
-            cached !== nothing && return Base.something(cached)::T
-
-            val = constructor()::T
-            if memoize_should_publish()
-                generating_output() && wipe_on_serialize!(m, :data, nothing)
-                memoize_slot_store!(data, key, Some{T}(val))
-            end
-            return val
-        end
     end
 end
 
 """
-    @memoize [key::T] [maxlen=...] begin
+    @memoize [key=expr::K | index=expr] begin
         # expensive computation
     end::T
 
@@ -127,32 +110,61 @@ Low-level, no-frills memoization macro that stores values in a process-local, ty
 The types of the caches are derived from the syntactical type assertions.
 All return values, including `nothing`, are memoized correctly.
 
-If the `maxlen` option is specified, the `key` is assumed to be an integer, and the
-cache will be a fixed-size array with length `maxlen`. Otherwise, a dictionary is used.
-On Julia 1.11+, fixed-size slots use atomic per-element access. Atomic slot access is
-lock-free for pointer-representable values; other values may use Julia's internal
-per-element atomic fallback.
+With no leading argument, a single value is memoized. Use `key=expr::K` for dictionary
+memoization keyed by values of type `K`. Use `index=expr` for array-backed memoization
+with small, dense, positive integer indices; sparse or large keys should use dictionary
+mode instead. Index mode grows the backing array on demand. On Julia 1.11+, index-mode
+slots use atomic per-element access. Atomic slot access is lock-free for
+pointer-representable values; other values may use Julia's internal per-element atomic
+fallback.
 """
 macro memoize(ex...)
     code = ex[end]
     args = ex[1:end-1]
 
     # decode the code body
-    @assert Meta.isexpr(code, :(::))
+    Meta.isexpr(code, :(::)) ||
+        throw(ArgumentError("@memoize requires the body to end in `end::T`"))
     rettyp = code.args[2]
     code = code.args[1]
 
     # decode the arguments
+    mode = :single
     key = nothing
-    if length(args) >= 1
-        arg = args[1]
-        @assert Meta.isexpr(arg, :(::))
-        key = (val=arg.args[1], typ=arg.args[2])
-    end
-    options = Dict()
-    for arg in args[2:end]
-        @assert Meta.isexpr(arg, :(=))
-        options[arg.args[1]] = arg.args[2]
+    index = nothing
+    for arg in args
+        if !Meta.isexpr(arg, :(=))
+            throw(ArgumentError(
+                "@memoize positional keys are no longer supported; use `key=expr::K` " *
+                "for dictionary mode or `index=expr` for array mode",
+            ))
+        end
+
+        name, val = arg.args
+        if name === :key
+            mode === :single ||
+                throw(ArgumentError("@memoize accepts only one of `key=` or `index=`"))
+            Meta.isexpr(val, :(::)) ||
+                throw(ArgumentError("@memoize `key=` requires a type assertion, e.g. `key=x::Int`"))
+            key = (val=val.args[1], typ=val.args[2])
+            mode = :dict
+        elseif name === :index
+            mode === :single ||
+                throw(ArgumentError("@memoize accepts only one of `key=` or `index=`"))
+            Meta.isexpr(val, :(::)) &&
+                throw(ArgumentError("@memoize `index=` does not take a type assertion; use `index=x`"))
+            index = val
+            mode = :array
+        elseif name === :maxlen
+            throw(ArgumentError(
+                "@memoize `maxlen=` is no longer supported; use `index=expr` for " *
+                "dense integer indices or `key=expr::K` for dictionary mode",
+            ))
+        else
+            throw(ArgumentError(
+                "@memoize unknown option `$name`; expected `key=expr::K` or `index=expr`",
+            ))
+        end
     end
 
     @gensym global_cache
@@ -161,9 +173,7 @@ macro memoize(ex...)
     fixed_ty = GlobalRef(mod, :FixedMemo)
     dict_ty = GlobalRef(mod, :DictMemo)
     slot_load = GlobalRef(mod, :memoize_slot_load)
-    slot_store = GlobalRef(mod, :memoize_slot_store!)
-    new_slots = GlobalRef(mod, :memoize_new_slots)
-    fixed_slow = GlobalRef(mod, :memoize_slow!)
+    grow_slow = GlobalRef(mod, :memoize_grow_slow!)
     should_publish = GlobalRef(mod, :memoize_should_publish)
     generating = GlobalRef(mod, :generating_output)
     wipe = GlobalRef(mod, :wipe_on_serialize!)
@@ -171,7 +181,7 @@ macro memoize(ex...)
     rettyp_esc = esc(rettyp)
     code_esc = esc(code)
 
-    if key === nothing
+    if mode === :single
         @eval __module__ begin
             const $global_cache = $lazy_ty{$rettyp}()
         end
@@ -188,73 +198,38 @@ macro memoize(ex...)
                 end
             end
         end
-    elseif haskey(options, :maxlen)
+    elseif mode === :array
         @eval __module__ begin
             const $global_cache = $fixed_ty{$rettyp}()
         end
 
-        key_val_esc = esc(key.val)
-        maxlen_esc = esc(options[:maxlen])
+        index_esc = esc(index)
         ex = quote
-            let cache = $(esc(global_cache)), key = $key_val_esc
+            let cache = $(esc(global_cache)), key = Int($index_esc)
                 @static if VERSION >= v"1.11"
                     data = @atomic :acquire cache.data
-                    if data !== nothing
+                    if data !== nothing && 1 <= key <= length(data)
                         cached_value = $slot_load(data, key)
                         if cached_value !== nothing
                             Base.something(cached_value)::$rettyp_esc
                         else
-                            $fixed_slow(cache, key, $maxlen_esc) do
+                            $grow_slow(cache, key) do
                                 $code_esc::$rettyp_esc
                             end
                         end
                     else
-                        $fixed_slow(cache, key, $maxlen_esc) do
+                        $grow_slow(cache, key) do
                             $code_esc::$rettyp_esc
                         end
                     end
                 else
-                    @lock cache.lock begin
-                        len = $maxlen_esc
-                        publish = $should_publish()
-                        data = @atomic :acquire cache.data
-                        if data === nothing
-                            if !publish
-                                checkbounds(1:len, key)
-                                $code_esc::$rettyp_esc
-                            else
-                                data = $new_slots($rettyp_esc, len)
-                                $generating() && $wipe(cache, :data, nothing)
-                                @atomic :release cache.data = data
-
-                                cached_value = $slot_load(data, key)
-                                if cached_value !== nothing
-                                    Base.something(cached_value)::$rettyp_esc
-                                else
-                                    new_value = $code_esc::$rettyp_esc
-                                    $generating() && $wipe(cache, :data, nothing)
-                                    $slot_store(data, key, Base.Some{$rettyp_esc}(new_value))
-                                    new_value
-                                end
-                            end
-                        else
-                            cached_value = $slot_load(data, key)
-                            if cached_value !== nothing
-                                Base.something(cached_value)::$rettyp_esc
-                            else
-                                new_value = $code_esc::$rettyp_esc
-                                if publish
-                                    $generating() && $wipe(cache, :data, nothing)
-                                    $slot_store(data, key, Base.Some{$rettyp_esc}(new_value))
-                                end
-                                new_value
-                            end
-                        end
+                    $grow_slow(cache, key) do
+                        $code_esc::$rettyp_esc
                     end
                 end
             end
         end
-    else
+    elseif mode === :dict
         @eval __module__ begin
             const $global_cache = $dict_ty{$(key.typ),$rettyp}()
         end
