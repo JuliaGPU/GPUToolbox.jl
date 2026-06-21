@@ -2,6 +2,7 @@ using Test
 using GPUToolbox
 using InteractiveUtils
 using IOCapture
+using Republic: public_names
 
 @testset "GPUToolbox.jl" begin
     @testset "SimpleVersion" begin
@@ -100,18 +101,16 @@ using IOCapture
         @test :B in exported
 
         # test with visibility=:public
-        @static if VERSION >= v"1.11"
-            mod_public = @eval module $(gensym())
-                using GPUToolbox
-                @enum MY_ENUM MY_ENUM_P MY_ENUM_Q
-                @enum_without_prefix visibility=:public MY_ENUM MY_ENUM_
-            end
-            @test mod_public.P == mod_public.MY_ENUM_P
-            @test mod_public.Q == mod_public.MY_ENUM_Q
-            # public but not exported
-            @test :P in names(mod_public)
-            @test !Base.isexported(mod_public, :P)
+        mod_public = @eval module $(gensym())
+            using GPUToolbox
+            @enum MY_ENUM MY_ENUM_P MY_ENUM_Q
+            @enum_without_prefix visibility=:public MY_ENUM MY_ENUM_
         end
+        @test mod_public.P == mod_public.MY_ENUM_P
+        @test mod_public.Q == mod_public.MY_ENUM_Q
+        # public but not exported
+        @test :P in public_names(mod_public)
+        @test !Base.isexported(mod_public, :P)
     end
 
     @testset "LazyInitialized" begin
