@@ -16,6 +16,7 @@ makedocs(;
     ),
     pages = [
         "Home" => "index.md",
+        "Overlays" => "overlays.md",
     ],
     doctest = true,
     linkcheck = true,

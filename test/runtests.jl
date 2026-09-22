@@ -482,4 +482,143 @@ using IOCapture
         @test occursin("time()", c.output)
         @test occursin("=", c.output)
     end
+
+    @testset "overlay audit" begin
+        Overlays = GPUToolbox.Overlays
+        # every override in the shared tables replaces a Base method, and they don't overlap
+        @test isempty(Overlays.audit(Overlays.float64_overrides))
+
+        @eval module AuditTest
+            Base.Experimental.@MethodTable(high)
+            Base.Experimental.@MethodTable(low)
+            struct Radians end
+            Base.Experimental.@overlay high Base.sin(x::Float32) = x
+            Base.Experimental.@overlay high Base.cos(x::Float32) = x
+            Base.Experimental.@overlay low Base.sin(x::Float32) = x
+            Base.Experimental.@overlay low Base.cos(x::Real) = x
+            Base.Experimental.@overlay low Base.Checked.throw_overflowerr_negation(op, x, y) = x
+            Base.Experimental.@overlay low Base.sin(x::Radians) = x
+        end
+        issues = Overlays.audit(AuditTest.high, AuditTest.low)
+        found(issue, sig) = any(i -> i.issue === issue && i.method.sig == sig, issues)
+        @test found(:shadowed, Tuple{typeof(sin), Float32})
+        @test found(:partly_shadowed, Tuple{typeof(cos), Real})
+        @test found(:dead, Tuple{typeof(Base.Checked.throw_overflowerr_negation), Any, Any, Any})
+        @test length(issues) == 3
+    end
+
+    # device overrides can be called on the CPU by invoking their method directly, but that
+    # requires Julia 1.12. Calls within the overrides then use Base's (host) methods.
+    VERSION >= v"1.12" && @testset "device overrides" begin
+        function override(f, args...)
+            sig = Tuple{typeof(f), map(typeof, args)...}
+            matches = Base._methods_by_ftype(sig, GPUToolbox.Overlays.float64_overrides, -1,
+                                             Base.get_world_counter())
+            invoke(f, only(matches).method, args...)
+        end
+
+        # error in ulps, compared to a more precise result
+        ulps(x::T, ref) where {T} = isequal(x, T(ref)) ? zero(T) : abs(x - T(ref)) / eps(T(ref))
+
+        @testset "comparisons" begin
+            xs = Float32[0, -0.0, 1, -1, 2^24, 2^24 + 2, 2^31, -2^31, 2^32, NaN, Inf, -Inf, 0.5]
+            ys = Any[Int32(0), Int32(1), Int32(-1), Int32(2^24 + 1), typemax(Int32),
+                     typemin(Int32), UInt32(2^24 + 1), typemax(UInt32)]
+            for op in (==, <, <=), x in xs, y in ys
+                @test override(op, x, y) == op(x, y)
+                @test override(op, y, x) == op(y, x)
+            end
+            for op in (==, <, <=), x in Float16[0, 1, 2048, 65504, Inf, NaN],
+                y in (Int32(2049), typemax(Int64), UInt64(1))
+                @test override(op, x, y) == op(x, y)
+                @test override(op, y, x) == op(y, x)
+            end
+        end
+
+        # matches Base for finite quotients with eps(x/y) <= 1, and for special values
+        v"1.12-" <= VERSION < v"1.14-" && @testset "div" begin
+            xs = Float32[1, 6, 3, -1, 1f7, 7, -7, 0.5, -0.5, 0, -0.0, Inf, -Inf, NaN]
+            ys = Float32[0.1, 0.1, 0.3, 0.1, 3, 2, -2, 1, 1, 1, -1, 1, 0, Inf, -Inf, NaN]
+            for x in [xs; 5f0; -5f0; 2.5f0; -1.5f0; floatmax(Float32); -floatmax(Float32)], y in [ys; 2f0], r in (RoundToZero, RoundDown, RoundUp,
+                RoundNearest, RoundFromZero, RoundNearestTiesAway, RoundNearestTiesUp)
+                @test isequal(override(div, x, y, r), div(x, y, r))
+            end
+        end
+
+        @testset "integer powers" begin
+            for x in (0.7f0, -1.3f0, 2f0, -0f0, 1.000001f0), n in (-7, -2, -1, 0, 1, 2, 3, 5, 12, 16777217)
+                @test ulps(override(^, x, n), big(x)^n) <= 2
+            end
+            @test override(^, -1f0, 16777217) == -1
+            @test override(^, -1f0, Int32(16777216)) == 1
+            @test override(^, -0f0, -16777217) == -Inf
+            @test override(^, 0.5f0, typemax(Int64)) == 0
+        end
+
+        @testset "hypot" begin
+            @test override(Base.Math._hypot, 3f0, 4f0) == 5
+            @test override(Base.Math._hypot, 3f30, 4f30) == 5f30
+            @test override(Base.Math._hypot, 3f-30, 4f-30) ≈ 5f-30
+        end
+
+        # the kernels used by `sind` and friends, on the converted argument
+        @testset "degree trigonometry" begin
+            for x in (0.001f0, 1f0, 30f0, 44.99f0, -45f0)
+                y = override(Base.Math.deg2rad_ext, x)
+                @test ulps(override(Base.Math.sin_kernel, y), sind(big(x))) <= 1
+                @test ulps(override(Base.Math.cos_kernel, y), cosd(big(x))) <= 1
+            end
+        end
+
+        @test override(sincospi, 0.25f0) == (sinpi(0.25f0), cospi(0.25f0))
+
+        @testset "complex division" begin
+            zs = ComplexF32[1 + 2im, -3f20 + 1f-20im, 2f38 + 2f38im, 1f-30 - 3f-30im, 1f-20 + 1im,
+                            0x1p64, complex(0x1p-64, 0x1p-64), 1f-10]
+            for a in zs, b in zs
+                @test override(/, a, b) ≈ ComplexF32(ComplexF64(a) / ComplexF64(b))
+            end
+            for b in zs
+                @test override(inv, b) ≈ ComplexF32(inv(ComplexF64(b)))
+            end
+            @test override(/, 2f38 + 2f38im, 2f38 + 2f38im) == 1
+            # normal components shouldn't be lost when subnormals are flushed to zero
+            ftz = get_zero_subnormals()
+            if set_zero_subnormals(true)
+                try
+                    @test override(/, 1f20 + 1f-20im, 1f-10 + 0im) ≈ 1f30 + 1f-10im
+                finally
+                    set_zero_subnormals(ftz)
+                end
+            end
+            @test isequal(override(inv, complex(Inf32, 1f0)), inv(complex(Inf32, 1f0)))
+            @test isequal(override(inv, complex(1f0, -0f0)), inv(complex(1f0, -0f0)))
+            @test isequal(override(/, 1f0 + 1f0im, complex(1f0, -Inf32)), (1f0 + 1f0im) / complex(1f0, -Inf32))
+            @test all(isnan, reim(override(inv, 0f0im)))
+            @test all(isnan, reim(override(/, 1f0 + 0im, 0f0im)))
+
+            # zero components have the same signs as Base's, which matters for branch cuts
+            vals = Float32[0, -0.0, 1, -1, 2, -2, 0.5, 3, -3]
+            exact(x, y) = all(((u, v),) -> iszero(v) || isinteger(v) ? isequal(u, v) : u ≈ v,
+                              zip(reim(x), reim(y)))
+            @test all(exact(override(/, complex(a, b), complex(c, d)), complex(a, b) / complex(c, d))
+                      for a in vals, b in vals, c in vals, d in vals if !iszero(c) || !iszero(d))
+            @test all(exact(override(inv, complex(c, d)), inv(complex(c, d)))
+                      for c in vals, d in vals if !iszero(c) || !iszero(d))
+            @test isequal(override(/, 1f0 + 0im, complex(-1f0, -0f0)), complex(-1f0, 0f0))
+
+            # a normal component shouldn't be lost when intermediate ratios underflow
+            q = override(/, complex(1f38, 0f0), complex(1f20, 1f-30))
+            @test real(q) ≈ 1f18 && imag(q) ≈ -1f-32
+
+            # normwise accuracy over the whole range
+            rnd() = Float32(randn() * 10.0^rand(-37:37))
+            for _ in 1:10_000
+                a, b = complex(rnd(), rnd()), complex(rnd(), rnd())
+                ref = ComplexF64(a) / ComplexF64(b)
+                floatmin(Float32) <= abs(ref) <= floatmax(Float32) / 4 || continue
+                @test abs(ComplexF64(override(/, a, b)) - ref) <= 2eps(Float32) * abs(ref)
+            end
+        end
+    end
 end
