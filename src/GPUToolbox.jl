@@ -9,5 +9,6 @@ include("literals.jl")
 include("enum.jl")
 include("threading.jl")
 include("memoization.jl")
+include("overlays.jl")
 
 end # module GPUToolbox

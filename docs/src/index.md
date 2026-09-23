@@ -4,4 +4,5 @@
 
 ```@autodocs
 Modules = [GPUToolbox]
+Filter = t -> t !== GPUToolbox.Overlays
 ```
