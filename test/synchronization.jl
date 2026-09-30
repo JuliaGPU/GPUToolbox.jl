@@ -54,6 +54,12 @@ end
     # completed operations are detected by polling
     @test cooperative_wait(blocking_wait, complete!(Operation()); isdone) === nothing
 
+    # polling can be limited to busy-waiting for some time
+    @test cooperative_wait(blocking_wait, complete!(Operation()); isdone, spin=1e-3) === nothing
+    @test cooperative_wait(blocking_wait, complete_after!(Operation(), 0.1); isdone,
+                           spin=1e-6) == Some(:waited)
+    @test_throws ArgumentError cooperative_wait(blocking_wait, Operation(); spin=-1)
+
     # without allocating (other than to shield from task cancellation, on Julia 1.14+)
     if !isdefined(Base, :CANCEL_TOKEN)
         op = complete!(Operation())

@@ -17,6 +17,19 @@ export cooperative_wait
 const SPIN_BUSY_ITERATIONS = 32
 const SPIN_ITERATIONS = 256
 
+# for devices that execute on the host's CPU cores, polling for that long competes with the
+# operation for those cores, so they only busy-wait for a limited time (in nanoseconds)
+function spin_until(isdone::F, obj, budget::UInt64) where {F}
+    isdone(obj) && return true
+    t0 = time_ns()
+    while time_ns() - t0 < budget
+        ccall(:jl_cpu_pause, Cvoid, ())
+        GC.safepoint()
+        isdone(obj) && return true
+    end
+    return false
+end
+
 function spin_until(isdone::F, obj) where {F}
     isdone(obj) && return true
     for i in 1:SPIN_ITERATIONS
@@ -360,9 +373,11 @@ used to detect short operations without involving another thread, and to poll `o
 all worker threads are busy. Objects that cannot be polled wait for a thread to become
 available instead.
 
-With `spin=false`, `obj` is not polled before waiting as described above. For devices that
-execute on the host's CPU cores, that is recommended: polling competes with the operation
-for those cores.
+`spin` determines how `obj` is polled before waiting as described above. By default, it is
+polled for a while, first busy-waiting and then yielding to other tasks. For devices that
+execute on the host's CPU cores, that competes with the operation for those cores, so pass
+a duration in seconds (e.g., `spin=10e-6`) to only busy-wait for at most that long. With
+`spin=false`, `obj` is not polled at all.
 
 Returns `Some(wait(obj))`, or `nothing` if `wait` was not called because polling or a
 notification found `obj` to have completed. In that case, calling `wait(obj)` should not
@@ -380,7 +395,9 @@ In finalizers, where it is not possible to switch tasks, and while generating ou
 during precompilation), `wait(obj)` is called on the calling thread instead.
 """
 function cooperative_wait(wait::W, obj; subscribe::S=nothing, isdone::D=nothing,
-                          spin::Bool=true, cancellable::Bool=false) where {W,S,D}
+                          spin::Union{Bool,Real}=true,
+                          cancellable::Bool=false) where {W,S,D}
+    spin isa Bool || spin >= 0 || throw(ArgumentError("spin duration must be non-negative"))
     if GC.in_finalizer() || generating_output()
         return Some(wait(obj))
     end
@@ -389,13 +406,15 @@ function cooperative_wait(wait::W, obj; subscribe::S=nothing, isdone::D=nothing,
     # like the slow path (see `wait_uninterrupted`), polling is shielded from cancellation,
     # and an interrupt is only thrown once the operation has completed, unless cancellable.
     interrupt = nothing
-    if isdone !== nothing && spin
+    if isdone !== nothing && spin !== false
+        poll = if spin === true
+            () -> spin_until(isdone, obj)
+        else
+            budget = round(UInt64, spin * 1e9)
+            () -> spin_until(isdone, obj, budget)
+        end
         done = try
-            if cancellable
-                spin_until(isdone, obj)
-            else
-                shielded(() -> spin_until(isdone, obj))
-            end
+            cancellable ? poll() : shielded(poll)
         catch err
             (cancellable || !(err isa InterruptException)) && rethrow()
             interrupt = err
