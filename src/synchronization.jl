@@ -167,14 +167,10 @@ mutable struct WaitState
 end
 
 # returns the completed request, or `nothing` if polling found `obj` to have completed
-function wait_cooperatively(wait, obj, isdone, spin, state)
+function wait_cooperatively(wait::W, obj, isdone::D, state) where {W,D}
     # when resuming an interrupted wait, keep waiting for the submitted request
     request = state.request
     if request === nothing
-        if isdone !== nothing && spin && spin_until(isdone, obj)
-            return nothing
-        end
-
         request = WaitRequest(wait, obj)
         while !submit!(state, request, isdone === nothing)
             # all workers are busy: poll the object, periodically checking for a worker
@@ -201,7 +197,7 @@ else
 end
 
 # run `f` without it being interrupted or cancelled
-uninterruptible(f) = shielded(() -> disable_sigint(f))
+uninterruptible(f::F) where {F} = shielded(() -> disable_sigint(f))
 
 """
     cooperative_wait(wait, obj; isdone=nothing, spin=true, cancellable=false)
@@ -225,9 +221,9 @@ or `isdone` are rethrown.
 
 If the wait is interrupted (i.e., an `InterruptException` is thrown) or the task is
 cancelled, the default is to keep waiting, and only throw once `obj` has completed: the
-operation may be using memory that the caller would release when unwinding. Note that `wait(obj)` may not
-have been called by then. Waits with `cancellable=true` throw immediately, while the
-operation may still be executing.
+operation may be using memory that the caller would release when unwinding. Note that
+`wait(obj)` may not have been called by then. Waits with `cancellable=true` throw
+immediately, while the operation may still be executing.
 
 In finalizers, where it is not possible to switch tasks, and while generating output (e.g.,
 during precompilation), `wait(obj)` is called on the calling thread instead.
@@ -238,11 +234,34 @@ function cooperative_wait(wait::W, obj; isdone::D=nothing, spin::Bool=true,
         return Some(wait(obj))
     end
 
-    state = WaitState(nothing, nothing)
+    # fast path: poll the object, without allocating the state needed for the slow path.
+    # like the slow path (see `wait_uninterrupted`), polling is shielded from cancellation,
+    # and an interrupt is only thrown once the operation has completed, unless cancellable.
+    interrupt = nothing
+    if isdone !== nothing && spin
+        done = try
+            if cancellable
+                spin_until(isdone, obj)
+            else
+                shielded(() -> spin_until(isdone, obj))
+            end
+        catch err
+            (cancellable || !(err isa InterruptException)) && rethrow()
+            interrupt = err
+            false
+        end
+        if done
+            cancellable || check_cancelled()
+            return nothing
+        end
+    end
+
+    # slow path: hand the wait to a worker thread
+    state = WaitState(nothing, interrupt)
     request = if cancellable
-        wait_cooperatively(wait, obj, isdone, spin, state)
+        wait_cooperatively(wait, obj, isdone, state)
     else
-        wait_uninterrupted(wait, obj, isdone, spin, state)
+        wait_uninterrupted(wait, obj, isdone, state)
     end
     request === nothing && return nothing
     request.failed && throw(request.result)
@@ -252,11 +271,11 @@ end
 # an interrupt can be delivered wherever we yield or hit a safepoint. keep waiting, resuming
 # from where we were, and throw the interrupt once done. cancellation is deferred by running
 # in a shielded scope.
-function wait_uninterrupted(wait, obj, isdone, spin, state)
+function wait_uninterrupted(wait::W, obj, isdone::D, state) where {W,D}
     ret = shielded() do
         while true
             try
-                return wait_cooperatively(wait, obj, isdone, spin, state)
+                return wait_cooperatively(wait, obj, isdone, state)
             catch err
                 err isa InterruptException || rethrow()
                 state.interrupt === nothing && (state.interrupt = err)

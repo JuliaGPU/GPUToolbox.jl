@@ -30,6 +30,14 @@ waiting(op) = timedwait(() -> @atomic(op.waited), 30) === :ok
     # completed operations are detected by polling
     @test cooperative_wait(blocking_wait, complete!(Operation()); isdone) === nothing
 
+    # without allocating (other than to shield from task cancellation, on Julia 1.14+)
+    if !isdefined(Base, :CANCEL_TOKEN)
+        op = complete!(Operation())
+        fast_wait(op) = cooperative_wait(blocking_wait, op; isdone)
+        fast_wait(op)
+        @test @allocated(fast_wait(op)) == 0
+    end
+
     # other tasks on this thread keep running while waiting on a worker
     for polled in (false, true)
         op = complete_after!(Operation(), 30)   # in case the thread is blocked
@@ -100,6 +108,31 @@ waiting(op) = timedwait(() -> @atomic(op.waited), 30) === :ok
         @test t.exception isa InterruptException
     end
 
+    # the same goes for interrupts while polling
+    for cancellable in (false, true)
+        op = Operation()
+        interrupted = Ref(false)
+        function interrupting_isdone(op)
+            interrupted[] || (interrupted[] = true; throw(InterruptException()))
+            return isdone(op)
+        end
+        t = @async cooperative_wait(blocking_wait, op; cancellable,
+                                    isdone=interrupting_isdone)
+        try
+            if cancellable
+                @test timedwait(() -> istaskdone(t), 30) === :ok
+                @test !isdone(op)
+            else
+                @test waiting(op)
+                @test !istaskdone(t)
+            end
+        finally
+            complete!(op)
+        end
+        @test_throws TaskFailedException wait(t)
+        @test t.exception isa InterruptException
+    end
+
     # the same goes for task cancellation
     if isdefined(Base, :CancellationTokenSource)
         src = Base.CancellationTokenSource()
@@ -118,6 +151,16 @@ waiting(op) = timedwait(() -> @atomic(op.waited), 30) === :ok
             complete!(op)
         end
         @test_throws TaskFailedException wait(t)
+
+        # also when polling finds the operation to have completed
+        src = Base.CancellationTokenSource()
+        Base.cancel!(src)
+        op = complete!(Operation())
+        t = Base.ScopedValues.with(Base.CANCEL_TOKEN => Base.CancellationToken(src)) do
+            @async cooperative_wait(blocking_wait, op; isdone)
+        end
+        @test_throws TaskFailedException wait(t)
+        @test t.exception isa Base.CancellationRequest
     end
 
     # finalizers cannot switch tasks, so they wait on the calling thread
