@@ -475,11 +475,11 @@ using IOCapture
     @testset "@debug_ccall" begin
         # Test that debug_ccall works and captures output
         c = IOCapture.capture() do
-            @debug_ccall time()::Cint
+            @debug_ccall time(C_NULL::Ptr{Cvoid})::Cint
         end
 
         @test c.value isa Cint
-        @test occursin("time()", c.output)
+        @test occursin("time(Ptr{Nothing}", c.output)
         @test occursin("=", c.output)
     end
 
