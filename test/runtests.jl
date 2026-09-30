@@ -621,4 +621,6 @@ using IOCapture
             end
         end
     end
+
+    include("synchronization.jl")
 end

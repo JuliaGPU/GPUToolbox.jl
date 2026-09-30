@@ -23,6 +23,7 @@ This package currently exports the following:
 - `@checked`: Add to a function definition to generate an unchecked and a checked version.
 - `@debug_ccall`: like `ccall` but prints the ccall, its arguments, and its return value
 - `@gcsafe_ccall`: like `@ccall` but marking it safe for the GC to run.
+- `cooperative_wait`: wait for a GPU operation without blocking the calling thread, so that other tasks can run.
 -  Suffix literals like `1i8` (`i8`, `i16`, `i32`, `u8`, `u16`, `u32`) for constructing literals of a certain type.
 
 It also provides `GPUToolbox.Overlays`, method tables with device overrides of Base
