@@ -1,0 +1,135 @@
+# an operation that the test completes explicitly, polled with `isdone` and waited for with
+# `blocking_wait`, which blocks GC-safely like a driver call would
+mutable struct Operation
+    @atomic done::Bool
+    @atomic waited::Bool    # whether `blocking_wait` has been called
+end
+Operation() = Operation(false, false)
+complete!(op::Operation) = (@atomic op.done = true; op)
+complete_after!(op::Operation, secs) = (Timer(_ -> complete!(op), secs); op)
+isdone(op::Operation) = @atomic op.done
+function blocking_wait(op::Operation)
+    @atomic op.waited = true
+    while !isdone(op)
+        @gcsafe_ccall uv_sleep(1::Cuint)::Cvoid
+    end
+    return :waited
+end
+
+function short_waits()
+    for _ in 1:10
+        cooperative_wait(blocking_wait, complete_after!(Operation(), 0.001); isdone)
+    end
+end
+
+# wait for a worker to be waiting on `op`. the task that submitted it then waits too, as long
+# as it runs on the current thread (i.e., it was created with `@async`).
+waiting(op) = timedwait(() -> @atomic(op.waited), 30) === :ok
+
+@testset "cooperative_wait" begin
+    # completed operations are detected by polling
+    @test cooperative_wait(blocking_wait, complete!(Operation()); isdone) === nothing
+
+    # other tasks on this thread keep running while waiting on a worker
+    for polled in (false, true)
+        op = complete_after!(Operation(), 30)   # in case the thread is blocked
+        t = @async cooperative_wait(blocking_wait, op; isdone=polled ? isdone : nothing,
+                                    spin=false)
+        try
+            @test waiting(op)
+            for _ in 1:100
+                yield()
+            end
+            @test !isdone(op)
+        finally
+            complete!(op)
+        end
+        @test fetch(t) == Some(:waited)
+    end
+
+    # errors are rethrown
+    @test_throws ErrorException("oops") cooperative_wait(_ -> error("oops"), nothing)
+    @test_throws InterruptException cooperative_wait(_ -> throw(InterruptException()), nothing)
+    @test_throws ErrorException("oops") cooperative_wait(blocking_wait, Operation();
+                                                         isdone=_ -> error("oops"))
+
+    # functions defined after the workers were started can be used
+    f = @eval _ -> :new_function
+    @test cooperative_wait(f, nothing) == Some(:new_function)
+
+    # a long wait does not delay other ones, even with more waits than worker threads
+    for polled in (false, true)
+        long = Operation()
+        waiter = Threads.@spawn cooperative_wait(blocking_wait, long;
+                                                 isdone=polled ? isdone : nothing)
+        shorts = Task[]
+        try
+            for _ in 1:8
+                push!(shorts, Threads.@spawn short_waits())
+            end
+            @test timedwait(() -> all(istaskdone, shorts), 30) === :ok
+            @test !istaskdone(waiter)
+        finally
+            complete!(long)
+        end
+        foreach(wait, shorts)
+        @test fetch(waiter) == Some(:waited)
+    end
+
+    # interrupted waits keep waiting until the operation completes, unless cancellable
+    for polled in (false, true), cancellable in (false, true)
+        op = Operation()
+        t = @async cooperative_wait(blocking_wait, op; cancellable, spin=false,
+                                    isdone=polled ? isdone : nothing)
+        try
+            @test waiting(op)
+            schedule(t, InterruptException(); error=true)
+            if cancellable
+                @test timedwait(() -> istaskdone(t), 30) === :ok
+                @test !isdone(op)
+            else
+                for _ in 1:100
+                    yield()
+                end
+                @test !istaskdone(t)
+            end
+        finally
+            complete!(op)
+        end
+        @test_throws TaskFailedException wait(t)
+        @test t.exception isa InterruptException
+    end
+
+    # the same goes for task cancellation
+    if isdefined(Base, :CancellationTokenSource)
+        src = Base.CancellationTokenSource()
+        op = Operation()
+        t = Base.ScopedValues.with(Base.CANCEL_TOKEN => Base.CancellationToken(src)) do
+            @async cooperative_wait(blocking_wait, op)
+        end
+        try
+            @test waiting(op)
+            Base.cancel!(src)
+            for _ in 1:100
+                yield()
+            end
+            @test !istaskdone(t)
+        finally
+            complete!(op)
+        end
+        @test_throws TaskFailedException wait(t)
+    end
+
+    # finalizers cannot switch tasks, so they wait on the calling thread
+    ret = Ref{Any}()
+    @noinline function finalized_object()
+        obj = Ref(0)
+        finalizer(obj) do _
+            ret[] = cooperative_wait(blocking_wait, complete!(Operation()))
+        end
+        return
+    end
+    finalized_object()
+    GC.gc(); GC.gc()
+    @test isassigned(ret) && ret[] == Some(:waited)
+end
