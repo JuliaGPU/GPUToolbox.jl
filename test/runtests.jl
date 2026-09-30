@@ -62,6 +62,14 @@ using IOCapture
             @gcsafe_ccall jl_rand()::UInt64
         end
 
+        # interpolated function pointers
+        fptr = cglobal(:jl_rand)
+        @test (@gcsafe_ccall $fptr()::UInt64) isa UInt64
+        if !GPUToolbox.HAS_CCALL_GCSAFE
+            # like `@ccall` on these Julia versions, the fallback checks the pointer
+            @test_throws ArgumentError @gcsafe_ccall $(nothing)()::UInt64
+        end
+
         let llvm = sprint(code_llvm, gc_safe_ccall, ())
             # check that the call works
             @test gc_safe_ccall() isa UInt64

@@ -120,10 +120,28 @@ else
         # we need to do so ourselves in order to insert a jl_gc_safe_enter|leave
         # just around the inner ccall
 
+        # like Base, support calling a function pointer that is interpolated with `$`
+        statements = []
+        if Meta.isexpr(func, :$)
+            fptr = gensym("fptr")
+            push!(statements, :($fptr = $(esc(func.args[1]))))
+            name = QuoteNode(func.args[1])
+            push!(statements, quote
+                if !isa($fptr, Ptr{Cvoid})
+                    throw(ArgumentError(LazyString("interpolated function `", $name,
+                                                   "` was not a Ptr{Cvoid}, but ",
+                                                   typeof($fptr))))
+                end
+            end)
+            func = fptr
+        else
+            func = esc(func)
+        end
+
         cconvert_exprs = []
         cconvert_args = []
         for (typ, arg) in zip(types, args)
-            var = gensym("$(func)_cconvert")
+            var = gensym("cconvert")
             push!(cconvert_args, var)
             push!(cconvert_exprs, :($var = Base.cconvert($(esc(typ)), $(esc(arg)))))
         end
@@ -131,7 +149,7 @@ else
         unsafe_convert_exprs = []
         unsafe_convert_args = []
         for (typ, arg) in zip(types, cconvert_args)
-            var = gensym("$(func)_unsafe_convert")
+            var = gensym("unsafe_convert")
             push!(unsafe_convert_args, var)
             push!(unsafe_convert_exprs, :($var = Base.unsafe_convert($(esc(typ)), $arg)))
         end
@@ -141,7 +159,7 @@ else
 
             gc_state = @ccall(jl_gc_safe_enter()::Int8)
             ret = ccall(
-                $(esc(func)), $(esc(rettype)), $(Expr(:tuple, map(esc, types)...)),
+                $func, $(esc(rettype)), $(Expr(:tuple, map(esc, types)...)),
                 $(unsafe_convert_args...)
             )
             @ccall(jl_gc_safe_leave(gc_state::Int8)::Cvoid)
@@ -150,6 +168,7 @@ else
 
         return quote
             @inline
+            $(statements...)
             $(cconvert_exprs...)
             GC.@preserve $(cconvert_args...) $(call)
         end
