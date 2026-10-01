@@ -54,8 +54,16 @@ end
 #
 # the number of workers is bounded, because drivers often spin while waiting, occupying a
 # CPU core per worker. when all workers are busy, objects that can be polled are polled on
-# the calling thread instead, until a worker becomes available. other objects have to wait
-# for one.
+# the calling thread instead, until a worker becomes available. other objects cannot wait
+# for one, as that could deadlock (e.g., when the busy workers wait for operations that only
+# complete after this wait does), so they get an overflow worker. those are kept separately,
+# and only serve such objects, so the number of workers polled objects can occupy (and that
+# can spin at the same time) remains bounded.
+#
+# workers never run finalizers, which may block (e.g., freeing GPU memory can wait for the
+# device to become idle). that would keep the worker from notifying its waiter, and could
+# deadlock if what the finalizer waits for depends on that. finalizers that become pending
+# on a worker thread (e.g., when it triggers a collection) run on another thread instead.
 
 mutable struct WaitRequest
     const wait::Any
@@ -69,22 +77,29 @@ end
 
 mutable struct WaitWorker
     const work::Base.Event      # autoreset
+    const overflow::Bool
     request::Union{Nothing,WaitRequest}
 
-    WaitWorker() = new(Base.Event(true), nothing)
+    WaitWorker(overflow::Bool) = new(Base.Event(true), overflow, nothing)
 end
 
 const MAX_WAIT_WORKERS = 4
-const wait_workers = WaitWorker[]       # all workers, keeping them rooted
+# all workers, keeping them rooted
+const wait_workers = WaitWorker[]
+const overflow_wait_workers = WaitWorker[]
+# idle workers
 const idle_wait_workers = WaitWorker[]
+const idle_overflow_wait_workers = WaitWorker[]
 const wait_worker_lock = ReentrantLock()
-const wait_worker_available = Threads.Condition(wait_worker_lock)
 
 # how long to poll before checking again whether a worker has become available
 const POLL_RETRY_NS = 100_000
 
 function wait_worker_loop(data::Ptr{Cvoid})
     worker = unsafe_pointer_to_objref(data)::WaitWorker
+    # never run finalizers on this thread (see above). this is never undone, so that also
+    # `GC.enable_finalizers()` when releasing a lock doesn't run them.
+    ccall(:jl_gc_disable_finalizers_internal, Cvoid, ())
     while true
         Base.wait(worker.work)
         request = worker.request::WaitRequest
@@ -105,17 +120,18 @@ function wait_worker_loop(data::Ptr{Cvoid})
     end
 end
 
+idle_workers(worker::WaitWorker) =
+    worker.overflow ? idle_overflow_wait_workers : idle_wait_workers
+
 function release_wait_worker(worker::WaitWorker)
-    @lock wait_worker_lock begin
-        push!(idle_wait_workers, worker)
-        notify(wait_worker_available)
-    end
+    @lock wait_worker_lock push!(idle_workers(worker), worker)
 end
 
 # needs to be called with `wait_worker_lock` held
-function create_wait_worker()
-    worker = WaitWorker()
-    push!(wait_workers, worker)
+function create_wait_worker(overflow::Bool)
+    worker = WaitWorker(overflow)
+    workers = overflow ? overflow_wait_workers : wait_workers
+    push!(workers, worker)
     started = false
     try
         # we don't know what the size of uv_thread_t is, so reserve enough space
@@ -128,43 +144,41 @@ function create_wait_worker()
         started = true
         ccall(:uv_thread_detach, Cint, (Ptr{Cvoid},), tid)
     finally
-        started || pop!(wait_workers)
+        started || pop!(workers)
     end
     return worker
 end
 
-# hand a request to a worker, returning whether one was available. if all workers are busy,
-# either wait for one to become available, or return `false`.
-function submit!(state, request::WaitRequest, wait::Bool)
+# hand a request to a worker, returning whether one was available. that is always the case
+# for objects that cannot be polled, which use an overflow worker when all others are busy.
+function submit!(state, request::WaitRequest, pollable::Bool)
     @lock wait_worker_lock begin
-        while true
-            # handing over the request must not be interrupted halfway, or the worker would
-            # be lost
-            submitted = uninterruptible() do
-                worker = if !isempty(idle_wait_workers)
-                    pop!(idle_wait_workers)
-                elseif length(wait_workers) < MAX_WAIT_WORKERS
-                    create_wait_worker()
-                else
-                    return false
-                end
-                worker.request = request
-                try
-                    notify(worker.work)
-                catch
-                    # only acquiring the event's lock can be interrupted (e.g., by an
-                    # exception scheduled onto this task), so nothing was published yet
-                    worker.request = nothing
-                    push!(idle_wait_workers, worker)
-                    notify(wait_worker_available)
-                    rethrow()
-                end
-                state.request = request
-                return true
+        # handing over the request must not be interrupted halfway, or the worker would be
+        # lost
+        uninterruptible() do
+            worker = if !isempty(idle_wait_workers)
+                pop!(idle_wait_workers)
+            elseif length(wait_workers) < MAX_WAIT_WORKERS
+                create_wait_worker(false)
+            elseif pollable
+                return false
+            elseif !isempty(idle_overflow_wait_workers)
+                pop!(idle_overflow_wait_workers)
+            else
+                create_wait_worker(true)
             end
-            submitted && return true
-            wait || return false
-            Base.wait(wait_worker_available)
+            worker.request = request
+            try
+                notify(worker.work)
+            catch
+                # only acquiring the event's lock can be interrupted (e.g., by an exception
+                # scheduled onto this task), so nothing was published yet
+                worker.request = nothing
+                push!(idle_workers(worker), worker)
+                rethrow()
+            end
+            state.request = request
+            return true
         end
     end
 end
@@ -293,7 +307,7 @@ function wait_cooperatively(wait::W, obj, isdone::D, state) where {W,D}
     request = state.request
     if request === nothing
         request = WaitRequest(wait, obj)
-        while !submit!(state, request, isdone === nothing)
+        while !submit!(state, request, isdone !== nothing)
             # all workers are busy: poll the object, periodically checking for a worker
             t0 = time_ns()
             while time_ns() - t0 < POLL_RETRY_NS
@@ -370,8 +384,8 @@ by then.
 
 `isdone(obj)`, if given, should return whether `obj` has completed without blocking. It is
 used to detect short operations without involving another thread, and to poll `obj` while
-all worker threads are busy. Objects that cannot be polled wait for a thread to become
-available instead.
+all worker threads are busy. Objects that cannot be polled get an additional thread
+instead.
 
 `spin` determines how `obj` is polled before waiting as described above. By default, it is
 polled for a while, first busy-waiting and then yielding to other tasks. For devices that
