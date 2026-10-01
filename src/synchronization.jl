@@ -195,13 +195,50 @@ end
 # loop to be available). the calling thread is adopted by Julia, which is safe as long as
 # driver calls that may be waiting on the callback are GC-safe.
 
-# a spin lock-based condition, so that signalling from a driver thread never blocks it in
-# Julia's scheduler (as a `ReentrantLock` could)
+# a spin lock whose waiters give up their CPU when they have to wait for long. the lock of a
+# completion is held by the driver's thread while it wakes up the waiting task, which
+# immediately takes the lock again. if that task runs on the same CPU, it preempts the
+# driver's thread, and would spin until the OS switches back. when all cores are busy (e.g.,
+# with PoCL executing the next kernel), that can take hundreds of µs.
+struct YieldingSpinLock <: Base.AbstractLock
+    lock::Threads.SpinLock
+end
+YieldingSpinLock() = YieldingSpinLock(Threads.SpinLock())
+
+const LOCK_SPIN_ITERATIONS = 100
+
+function Base.lock(l::YieldingSpinLock)
+    i = 0
+    while !trylock(l.lock)
+        if i < LOCK_SPIN_ITERATIONS
+            ccall(:jl_cpu_pause, Cvoid, ())
+            i += 1
+        else
+            yield_cpu()
+        end
+        GC.safepoint()
+    end
+    return
+end
+Base.trylock(l::YieldingSpinLock) = trylock(l.lock)
+Base.unlock(l::YieldingSpinLock) = unlock(l.lock)
+Base.islocked(l::YieldingSpinLock) = islocked(l.lock)
+Base.assert_havelock(l::YieldingSpinLock) = Base.assert_havelock(l.lock)
+
+# let the OS run another thread on this CPU
+@static if Sys.iswindows()
+    yield_cpu() = ccall((:SwitchToThread, "kernel32"), stdcall, Cint, ())
+else
+    yield_cpu() = ccall(:sched_yield, Cint, ())
+end
+
+# a condition protected by a spin lock, so that signalling from a driver thread never blocks
+# it in Julia's scheduler (as a `ReentrantLock` could)
 mutable struct Completion
-    const cond::Base.ThreadSynchronizer
+    const cond::Base.GenericCondition{YieldingSpinLock}
     @atomic state::Int      # one of the constants below
 
-    Completion() = new(Base.ThreadSynchronizer(), PENDING)
+    Completion() = new(Base.GenericCondition(YieldingSpinLock()), PENDING)
 end
 const PENDING = 0
 const SIGNALLED = 1

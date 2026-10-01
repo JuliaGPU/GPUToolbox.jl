@@ -333,3 +333,67 @@ end
     GC.gc(); GC.gc()
     @test isassigned(ret) && ret[] == Some(:waited)
 end
+
+# run `f` on a thread that is not managed by Julia
+mutable struct ForeignCall
+    const f::Any
+    @atomic done::Bool
+    @atomic failed::Bool
+end
+const foreign_calls = ForeignCall[]     # keep them alive
+function foreign_call(arg::Ptr{Cvoid})
+    call = unsafe_pointer_to_objref(arg)::ForeignCall
+    try
+        call.f()
+    catch
+        @atomic call.failed = true
+    end
+    @atomic call.done = true
+    return
+end
+function on_foreign_thread(f)
+    call = ForeignCall(f, false, false)
+    push!(foreign_calls, call)
+    tid = Ref{NTuple{32, UInt8}}(ntuple(_ -> 0x0, 32))
+    cb = @cfunction(foreign_call, Cvoid, (Ptr{Cvoid},))
+    err = ccall(:uv_thread_create, Cint, (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
+                tid, cb, pointer_from_objref(call))
+    @test err == 0
+    ccall(:uv_thread_detach, Cint, (Ptr{Cvoid},), tid)
+    return call
+end
+
+@testset "completion lock" begin
+    # a task that is woken up while the notifying thread still holds the lock waits for it
+    # to be released
+    cond = Base.GenericCondition(GPUToolbox.YieldingSpinLock())
+    signalled = Ref(false)
+    waiter = @async @lock cond begin
+        while !signalled[]
+            wait(cond)
+        end
+        islocked(cond)
+    end
+    call = on_foreign_thread() do
+        @lock cond begin
+            signalled[] = true
+            notify(cond)
+            @gcsafe_ccall uv_sleep(10::Cuint)::Cvoid
+        end
+    end
+    @test timedwait(() -> istaskdone(waiter), 30) === :ok
+    @test fetch(waiter)
+    @test timedwait(() -> @atomic(call.done), 30) === :ok
+    @test !@atomic(call.failed)
+
+    # a driver thread waiting for the lock lets the garbage collector run
+    c = GPUToolbox.Completion()
+    GC.@preserve c begin
+        lock(c.cond)
+        signal_later(pointer_from_objref(c), 0)
+        @gcsafe_ccall uv_sleep(10::Cuint)::Cvoid
+        GC.gc()
+        unlock(c.cond)
+        @test timedwait(() -> (@atomic c.state) == GPUToolbox.RELEASED, 30) === :ok
+    end
+end
