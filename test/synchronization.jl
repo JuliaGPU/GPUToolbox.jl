@@ -26,9 +26,47 @@ end
 # as it runs on the current thread (i.e., it was created with `@async`).
 waiting(op) = timedwait(() -> @atomic(op.waited), 30) === :ok
 
+# signal a completion after a delay, from a thread that is not managed by Julia (like a
+# driver's callback thread)
+struct DelayedSignal
+    payload::Ptr{Cvoid}
+    ms::Cuint
+end
+function delayed_signal(arg::Ptr{DelayedSignal})
+    signal = unsafe_load(arg)
+    Libc.free(arg)
+    @gcsafe_ccall uv_sleep(signal.ms::Cuint)::Cvoid
+    GPUToolbox.signal_completion(signal.payload)
+    return
+end
+function signal_later(payload, ms)
+    arg = convert(Ptr{DelayedSignal}, Libc.malloc(sizeof(DelayedSignal)))
+    unsafe_store!(arg, DelayedSignal(payload, ms))
+    tid = Ref{NTuple{32, UInt8}}(ntuple(_ -> 0x0, 32))
+    cb = @cfunction(delayed_signal, Cvoid, (Ptr{DelayedSignal},))
+    err = ccall(:uv_thread_create, Cint, (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}), tid, cb, arg)
+    @test err == 0
+    ccall(:uv_thread_detach, Cint, (Ptr{Cvoid},), tid)
+    return
+end
+
 @testset "cooperative_wait" begin
     # completed operations are detected by polling
     @test cooperative_wait(blocking_wait, complete!(Operation()); isdone) === nothing
+
+    # polling can be limited to busy-waiting for some time
+    @test cooperative_wait(blocking_wait, complete!(Operation()); isdone, spin=1e-3) === nothing
+    @test cooperative_wait(blocking_wait, complete_after!(Operation(), 0.1); isdone,
+                           spin=1e-6) == Some(:waited)
+    @test_throws ArgumentError cooperative_wait(blocking_wait, Operation(); spin=-1)
+
+    # without allocating (other than to shield from task cancellation, on Julia 1.14+)
+    if !isdefined(Base, :CANCEL_TOKEN)
+        op = complete!(Operation())
+        fast_wait(op) = cooperative_wait(blocking_wait, op; isdone)
+        fast_wait(op)
+        @test @allocated(fast_wait(op)) == 0
+    end
 
     # other tasks on this thread keep running while waiting on a worker
     for polled in (false, true)
@@ -100,6 +138,31 @@ waiting(op) = timedwait(() -> @atomic(op.waited), 30) === :ok
         @test t.exception isa InterruptException
     end
 
+    # the same goes for interrupts while polling
+    for cancellable in (false, true)
+        op = Operation()
+        interrupted = Ref(false)
+        function interrupting_isdone(op)
+            interrupted[] || (interrupted[] = true; throw(InterruptException()))
+            return isdone(op)
+        end
+        t = @async cooperative_wait(blocking_wait, op; cancellable,
+                                    isdone=interrupting_isdone)
+        try
+            if cancellable
+                @test timedwait(() -> istaskdone(t), 30) === :ok
+                @test !isdone(op)
+            else
+                @test waiting(op)
+                @test !istaskdone(t)
+            end
+        finally
+            complete!(op)
+        end
+        @test_throws TaskFailedException wait(t)
+        @test t.exception isa InterruptException
+    end
+
     # the same goes for task cancellation
     if isdefined(Base, :CancellationTokenSource)
         src = Base.CancellationTokenSource()
@@ -118,6 +181,103 @@ waiting(op) = timedwait(() -> @atomic(op.waited), 30) === :ok
             complete!(op)
         end
         @test_throws TaskFailedException wait(t)
+
+        # also when polling finds the operation to have completed
+        src = Base.CancellationTokenSource()
+        Base.cancel!(src)
+        op = complete!(Operation())
+        t = Base.ScopedValues.with(Base.CANCEL_TOKEN => Base.CancellationToken(src)) do
+            @async cooperative_wait(blocking_wait, op; isdone)
+        end
+        @test_throws TaskFailedException wait(t)
+        @test t.exception isa Base.CancellationRequest
+    end
+
+    # completion notifications from the driver, instead of a worker
+    let
+        # the callback may be invoked before registration returns
+        subscribed = Ref(0)
+        immediate = function (op, payload)
+            subscribed[] += 1
+            GPUToolbox.signal_completion(payload)
+        end
+        @test cooperative_wait(blocking_wait, Operation(); subscribe=immediate) === nothing
+        @test subscribed[] == 1
+
+        # or later, from another thread, while other tasks on this thread keep running
+        ticks = Ref(0)
+        ticker = @async while ticks[] >= 0
+            ticks[] += 1
+            sleep(0.001)
+        end
+        op = Operation()
+        @test cooperative_wait(blocking_wait, op; subscribe=(_, p) -> signal_later(p, 100),
+                               isdone, spin=false) === nothing
+        @test !@atomic(op.waited)
+        @test ticks[] > 0
+        ticks[] = -1
+        wait(ticker)
+
+        # errors while registering are rethrown
+        failing = (_, _) -> error("oops")
+        @test_throws ErrorException("oops") cooperative_wait(blocking_wait, Operation();
+                                                             subscribe=failing)
+
+        # interrupted waits keep waiting until notified, unless cancellable, in which case
+        # a later notification is harmless
+        for cancellable in (false, true)
+            notified = Base.Event()
+            payload = Ref{Ptr{Cvoid}}(C_NULL)
+            subscribe = (_, p) -> (payload[] = p; notify(notified))
+            t = @async cooperative_wait(blocking_wait, Operation(); subscribe, cancellable)
+            wait(notified)
+            yield()
+            schedule(t, InterruptException(); error=true)
+            if cancellable
+                @test timedwait(() -> istaskdone(t), 30) === :ok
+                GC.gc()
+                signal_later(payload[], 10)
+                sleep(0.1)
+            else
+                for _ in 1:100
+                    yield()
+                end
+                @test !istaskdone(t)
+                signal_later(payload[], 10)
+            end
+            @test_throws TaskFailedException wait(t)
+            @test t.exception isa InterruptException
+        end
+
+        # the same goes for task cancellation
+        if isdefined(Base, :CancellationTokenSource)
+            for cancellable in (false, true)
+                src = Base.CancellationTokenSource()
+                notified = Base.Event()
+                payload = Ref{Ptr{Cvoid}}(C_NULL)
+                subscribe = (_, p) -> (payload[] = p; notify(notified))
+                token = Base.CancellationToken(src)
+                t = Base.ScopedValues.with(Base.CANCEL_TOKEN => token) do
+                    @async cooperative_wait(blocking_wait, Operation(); subscribe,
+                                            cancellable)
+                end
+                wait(notified)
+                Base.cancel!(src)
+                if cancellable
+                    @test timedwait(() -> istaskdone(t), 30) === :ok
+                    GC.gc()
+                    signal_later(payload[], 10)
+                    sleep(0.1)
+                else
+                    for _ in 1:100
+                        yield()
+                    end
+                    @test !istaskdone(t)
+                    signal_later(payload[], 10)
+                end
+                @test_throws TaskFailedException wait(t)
+            end
+        end
     end
 
     # finalizers cannot switch tasks, so they wait on the calling thread
