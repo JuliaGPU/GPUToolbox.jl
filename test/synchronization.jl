@@ -114,6 +114,46 @@ end
         @test fetch(waiter) == Some(:waited)
     end
 
+    # objects that cannot be polled do not wait for a worker to become available, as the
+    # busy ones may be waiting for something that depends on it. the workers used for
+    # those are not used for objects that can be polled, so that those remain bounded.
+    let ops = [Operation() for _ in 1:2*GPUToolbox.MAX_WAIT_WORKERS]
+        waiters = map(ops) do op
+            @async cooperative_wait(blocking_wait, op; isdone, spin=false)
+        end
+        n_waited() = count(op -> @atomic(op.waited), ops)
+        nonpolled = nothing
+        try
+            @test timedwait(() -> n_waited() == GPUToolbox.MAX_WAIT_WORKERS, 30) === :ok
+
+            nonpolled = Threads.@spawn cooperative_wait(blocking_wait, complete!(Operation()))
+            @test timedwait(() -> istaskdone(nonpolled), 30) === :ok
+
+            for _ in 1:100
+                yield()
+            end
+            @test n_waited() == GPUToolbox.MAX_WAIT_WORKERS
+        finally
+            foreach(complete!, ops)
+        end
+        @test fetch(nonpolled) == Some(:waited)
+        foreach(wait, waiters)
+    end
+
+    # finalizers do not run on worker threads, where they could block it
+    let pools = Symbol[]
+        @noinline function object_with_finalizer()
+            obj = Ref(0)
+            finalizer(_ -> push!(pools, Threads.threadpool()), obj)
+            return
+        end
+        collect_on_worker(_) = (object_with_finalizer(); GC.gc(); :collected)
+        @test cooperative_wait(collect_on_worker, nothing) == Some(:collected)
+        GC.gc()
+        @test timedwait(() -> (yield(); !isempty(pools)), 30) === :ok
+        @test :foreign ∉ pools
+    end
+
     # interrupted waits keep waiting until the operation completes, unless cancellable
     for polled in (false, true), cancellable in (false, true)
         op = Operation()
