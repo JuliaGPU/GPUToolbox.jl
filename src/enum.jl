@@ -1,5 +1,6 @@
 export @enum_without_prefix
 
+using Republic: @public
 
 ## redeclare enum values without a prefix
 
@@ -50,9 +51,7 @@ macro enum_without_prefix(ex...)
         if visibility == :export
             push!(ex.args, :(export $short))
         elseif visibility == :public
-            if VERSION >= v"1.11.0-DEV.469"
-                push!(ex.args, Expr(:public, short))
-            end
+            push!(ex.args, :($(@__MODULE__).@public $short))
         end
     end
 
