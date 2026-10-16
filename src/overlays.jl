@@ -69,10 +69,13 @@ Back-ends can check their stack with [`audit`](@ref), e.g., as part of their tes
 
 - [`float64_overrides`](@ref): overrides of Base methods that use `Float64` to compute
   single- or half-precision results.
+- [`int128_overrides`](@ref): overrides of Base methods that use 128-bit integers to compute
+  results for narrower ones.
 """
 module Overlays
 
 include("overlays/float64.jl")
+include("overlays/int128.jl")
 
 
 ## checking

@@ -494,7 +494,7 @@ using IOCapture
     @testset "overlay audit" begin
         Overlays = GPUToolbox.Overlays
         # every override in the shared tables replaces a Base method, and they don't overlap
-        @test isempty(Overlays.audit(Overlays.float64_overrides))
+        @test isempty(Overlays.audit(Overlays.float64_overrides, Overlays.int128_overrides))
 
         @eval module AuditTest
             Base.Experimental.@MethodTable(high)
@@ -518,10 +518,9 @@ using IOCapture
     # device overrides can be called on the CPU by invoking their method directly, but that
     # requires Julia 1.12. Calls within the overrides then use Base's (host) methods.
     VERSION >= v"1.12" && @testset "device overrides" begin
-        function override(f, args...)
+        function override(f, args...; table=GPUToolbox.Overlays.float64_overrides)
             sig = Tuple{typeof(f), map(typeof, args)...}
-            matches = Base._methods_by_ftype(sig, GPUToolbox.Overlays.float64_overrides, -1,
-                                             Base.get_world_counter())
+            matches = Base._methods_by_ftype(sig, table, -1, Base.get_world_counter())
             invoke(f, only(matches).method, args...)
         end
 
@@ -626,6 +625,58 @@ using IOCapture
                 ref = ComplexF64(a) / ComplexF64(b)
                 floatmin(Float32) <= abs(ref) <= floatmax(Float32) / 4 || continue
                 @test abs(ComplexF64(override(/, a, b)) - ref) <= 2eps(Float32) * abs(ref)
+            end
+        end
+
+        @testset "rational comparisons" begin
+            int128(f, args...) = override(f, args...; table=GPUToolbox.Overlays.int128_overrides)
+            ints = Any[0, 1, -1, 3, -7, typemax(Int64), typemin(Int64), typemax(Int64) - 1,
+                       2^32, 2^32 + 1, -2^32, typemax(UInt64), UInt64(2)^63, Int32(-5),
+                       typemax(Int32), typemin(Int32), UInt32(7), Int8(-128)]
+            dens = Any[1, 2, 3, typemax(Int64), 2^32 + 1, typemax(UInt64), UInt64(2)^63,
+                       Int32(3), typemax(Int32), UInt8(255)]
+            rats = Any[]
+            for n in ints, d in dens
+                n isa Signed && d isa Unsigned && n < 0 && continue
+                q = try
+                    n // d
+                catch err
+                    err isa InexactError || err isa OverflowError || rethrow()
+                    continue
+                end
+                q isa Rational{<:Base.BitInteger64} && push!(rats, q)
+            end
+            for op in (<, <=)
+                for x in rats, y in rats
+                    @test int128(op, x, y) == op(x, y)
+                end
+                for x in rats, y in ints
+                    @test int128(op, x, y) == op(x, y)
+                    @test int128(op, y, x) == op(y, x)
+                end
+            end
+            floats = Any[0f0, -0f0, 1f0, -1f0, 0.5f0, -1.5f0, 3f0, 2f0^31, 2f0^63, 2f0^64,
+                         -2f0^63, floatmax(Float32), nextfloat(0f0), Inf32, -Inf32, NaN32,
+                         Float16(1.5), Float16(-65504), 1.5, 2.0^100, -2.0^-1074, NaN]
+            for op in (<, <=, cmp), x in rats, y in floats
+                @test int128(op, x, y) == op(x, y)
+                @test int128(op, y, x) == op(y, x)
+            end
+            rnd(T) = rand(T) >> rand(0:8sizeof(T)-1)
+            for _ in 1:10_000
+                x, y = rnd(Int64) // max(rnd(Int64), 1), rnd(Int64) // max(rnd(Int64), 1)
+                n = rnd(UInt64)
+                @test int128(<, x, y) == (x < y)
+                @test int128(<=, x, n) == (x <= n)
+                @test int128(<, Float32(y), x) == (Float32(y) < x)
+            end
+            # fractions that are close to floating-point numbers
+            for (n, d) in ((1, 3), (typemax(Int64), typemax(Int64) - 1),
+                           (2^53 + 1, 2^53), (-2^24 - 1, 2^24)),
+                x in (Float32(n / d), prevfloat(Float32(n / d)), nextfloat(Float32(n / d)),
+                      n / d, prevfloat(n / d), nextfloat(n / d)), op in (<, <=, cmp)
+                @test int128(op, n // d, x) == op(n // d, x)
+                @test int128(op, x, n // d) == op(x, n // d)
             end
         end
     end
