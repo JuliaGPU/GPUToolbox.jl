@@ -419,15 +419,25 @@ end
     @test timedwait(() -> @atomic(call.done), 30) === :ok
     @test !@atomic(call.failed)
 
-    # a driver thread waiting for the lock lets the garbage collector run
-    c = GPUToolbox.Completion()
-    @atomic c.state = GPUToolbox.PENDING
-    GC.@preserve c begin
-        lock(c.cond)
-        signal_later(pointer_from_objref(c), 0)
-        @gcsafe_ccall uv_sleep(10::Cuint)::Cvoid
-        GC.gc()
-        unlock(c.cond)
-        @test timedwait(() -> (@atomic c.state) == GPUToolbox.RELEASED, 30) === :ok
+    # a driver thread waiting for the lock lets the garbage collector run.
+    #
+    # on macOS, Julia 1.14's safepoint handler identifies the faulting thread by its pthread
+    # id without skipping threads that have exited (JuliaLang/julia#63893). a foreign
+    # thread that reuses the id of one that exited, like the one above, is then resumed
+    # instead of parked, and the collector waits for it forever.
+    # TODO: bound the version range once this is fixed upstream
+    if Sys.isapple() && VERSION >= v"1.14.0-DEV"
+        @test_skip "collecting while a foreign thread waits for the lock"
+    else
+        c = GPUToolbox.Completion()
+        @atomic c.state = GPUToolbox.PENDING
+        GC.@preserve c begin
+            lock(c.cond)
+            signal_later(pointer_from_objref(c), 0)
+            @gcsafe_ccall uv_sleep(10::Cuint)::Cvoid
+            GC.gc()
+            unlock(c.cond)
+            @test timedwait(() -> (@atomic c.state) == GPUToolbox.RELEASED, 30) === :ok
+        end
     end
 end
