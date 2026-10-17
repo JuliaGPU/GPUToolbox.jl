@@ -71,8 +71,9 @@ mutable struct WaitRequest
     const done::Base.Event
     result::Any
     failed::Bool
+    submitted::Bool     # whether a worker has been handed the request
 
-    WaitRequest(wait, obj) = new(wait, obj, Base.Event(), nothing, false)
+    WaitRequest(wait, obj) = new(wait, obj, Base.Event(), nothing, false, false)
 end
 
 mutable struct WaitWorker
@@ -151,7 +152,7 @@ end
 
 # hand a request to a worker, returning whether one was available. that is always the case
 # for objects that cannot be polled, which use an overflow worker when all others are busy.
-function submit!(state, request::WaitRequest, pollable::Bool)
+function submit!(request::WaitRequest, pollable::Bool)
     @lock wait_worker_lock begin
         # handing over the request must not be interrupted halfway, or the worker would be
         # lost
@@ -177,7 +178,7 @@ function submit!(state, request::WaitRequest, pollable::Bool)
                 push!(idle_workers(worker), worker)
                 rethrow()
             end
-            state.request = request
+            request.submitted = true
             return true
         end
     end
@@ -237,29 +238,37 @@ end
 mutable struct Completion
     const cond::Base.GenericCondition{YieldingSpinLock}
     @atomic state::Int      # one of the constants below
+    registered::Bool        # whether the current waiter has registered the callback
 
-    Completion() = new(Base.GenericCondition(YieldingSpinLock()), PENDING)
+    Completion() = new(Base.GenericCondition(YieldingSpinLock()), RELEASED, false)
 end
 const PENDING = 0
 const SIGNALLED = 1
-const RELEASED = 2          # the callback does not access the completion anymore
+const RELEASED = 2          # the callback does not access the completion (anymore)
 
-# completions whose waiter stopped waiting (e.g., because it was cancelled), kept alive
-# until the driver has signalled them
-const abandoned_completions = Completion[]
-const abandoned_completions_lock = ReentrantLock()
+# completions are reused, so that waiting for one does not allocate. a completion goes back
+# to the pool when its waiter is done with it, but it may still be in use by the callback
+# (e.g., when the wait was interrupted, or the callback has not returned yet), so it is only
+# taken out again once released. until then, the pool keeps it alive.
+const completion_pool = Completion[]
+const completion_pool_lock = Threads.SpinLock()
 
-function sweep_abandoned_completions()
-    filter!(c -> (@atomic :acquire c.state) != RELEASED, abandoned_completions)
-end
-
-function abandon_completion(c::Completion)
-    @lock abandoned_completions_lock begin
-        sweep_abandoned_completions()
-        push!(abandoned_completions, c)
+function acquire_completion()
+    @lock completion_pool_lock begin
+        for i in length(completion_pool):-1:1
+            c = completion_pool[i]
+            if (@atomic :acquire c.state) == RELEASED
+                completion_pool[i] = completion_pool[end]
+                pop!(completion_pool)
+                c.registered = false
+                return c
+            end
+        end
     end
-    return
+    return Completion()
 end
+
+release_completion(c::Completion) = @lock completion_pool_lock push!(completion_pool, c)
 
 """
     GPUToolbox.signal_completion(payload::Ptr{Cvoid})
@@ -284,78 +293,48 @@ function signal_completion(payload::Ptr{Cvoid})
     return
 end
 
-# register a completion notification, or return the one registered already when resuming
-# an interrupted wait
-function subscribe!(subscribe::F, obj, state) where {F}
-    registered = state.completion
-    registered === nothing || return registered
-
-    # reclaim completions that were abandoned by earlier waits
-    if !isempty(abandoned_completions)
-        @lock abandoned_completions_lock sweep_abandoned_completions()
-    end
-
-    # registering the notification and keeping track of it must not be interrupted, or a
-    # retry would register it again, or we would lose track of it. registration may invoke
-    # the callback immediately, which is fine.
-    c = Completion()
-    uninterruptible() do
-        GC.@preserve c subscribe(obj, pointer_from_objref(c))
-        state.completion = c
-    end
-    return c
-end
-
-# returns the completion once it has been signalled
-function wait_completion(subscribe::F, obj, state) where {F}
+# register a completion notification for `obj`, unless already done (when resuming an
+# interrupted wait). this must not be interrupted, or we would not know whether the
+# callback was registered.
+function subscribe!(subscribe::F, obj, c::Completion) where {F}
+    c.registered && return
+    @atomic c.state = PENDING
     try
-        c = subscribe!(subscribe, obj, state)
-        @lock c.cond while (@atomic c.state) == PENDING
-            Base.wait(c.cond)
-        end
-        return c
+        # registration may invoke the callback immediately, which is fine
+        GC.@preserve c subscribe(obj, pointer_from_objref(c))
     catch
-        # when unwinding (e.g., because of an interrupt), the callback may still use the
-        # completion, so keep it alive until then. an interrupted wait that is resumed
-        # waits for the same completion, which is fine.
-        registered = state.completion
-        if registered !== nothing && (@atomic :acquire registered.state) != RELEASED
-            uninterruptible(() -> abandon_completion(registered))
-        end
+        # the callback was not registered, so the completion can be reused
+        @atomic c.state = RELEASED
         rethrow()
     end
+    c.registered = true
+    return
+end
+
+function wait_completion(c::Completion)
+    @lock c.cond while (@atomic c.state) == PENDING
+        Base.wait(c.cond)
+    end
+    return
 end
 
 
 ## entry point
 
-mutable struct WaitState
-    # the request submitted to a worker, if any
-    request::Union{Nothing,WaitRequest}
-    # the completion notification registered, if any
-    completion::Union{Nothing,Completion}
-    # the first interrupt, to be thrown once the wait has completed
-    interrupt::Union{Nothing,InterruptException}
-end
-
-# returns the completed request, or `nothing` if polling found `obj` to have completed
-function wait_cooperatively(wait::W, obj, isdone::D, state) where {W,D}
-    # when resuming an interrupted wait, keep waiting for the submitted request
-    request = state.request
-    if request === nothing
-        request = WaitRequest(wait, obj)
-        while !submit!(state, request, isdone !== nothing)
-            # all workers are busy: poll the object, periodically checking for a worker
-            t0 = time_ns()
-            while time_ns() - t0 < POLL_RETRY_NS
-                isdone(obj) && return nothing
-                yield()
-            end
+# returns whether `obj` completed while polling for a worker to become available. when
+# resuming an interrupted wait, keeps waiting for the submitted request.
+function wait_cooperatively(request::WaitRequest, obj, isdone::D) where {D}
+    while !request.submitted && !submit!(request, isdone !== nothing)
+        # all workers are busy: poll the object, periodically checking for a worker
+        t0 = time_ns()
+        while time_ns() - t0 < POLL_RETRY_NS
+            isdone(obj) && return true
+            yield()
         end
     end
 
     Base.wait(request.done)
-    return request
+    return false
 end
 
 # run `f` in a scope that task cancellation does not apply to, and check afterwards whether
@@ -478,33 +457,49 @@ function cooperative_wait(wait::W, obj; subscribe::S=nothing, isdone::D=nothing,
     end
 
     # slow path: wait for a completion notification, or hand the wait to a worker thread
-    state = WaitState(nothing, nothing, interrupt)
-    slow_wait = if subscribe === nothing
-        () -> wait_cooperatively(wait, obj, isdone, state)
+    if subscribe === nothing
+        request = WaitRequest(wait, obj)
+        slow_wait = () -> wait_cooperatively(request, obj, isdone)
+        polled = cancellable ? slow_wait() : wait_uninterrupted(slow_wait, interrupt)
+        polled && return nothing
+        request.failed && throw(request.result)
+        return Some(request.result)
     else
-        () -> wait_completion(subscribe, obj, state)
+        c = acquire_completion()
+        try
+            slow_wait = function ()
+                uninterruptible(() -> subscribe!(subscribe, obj, c))
+                wait_completion(c)
+            end
+            cancellable ? slow_wait() : wait_uninterrupted(slow_wait, interrupt)
+        finally
+            # when unwinding (e.g., because of an interrupt), the callback may still use
+            # the completion, which the pool keeps alive until then
+            disable_sigint(() -> release_completion(c))
+        end
+        return nothing
     end
-    ret = cancellable ? slow_wait() : wait_uninterrupted(slow_wait, state)
-    ret isa WaitRequest || return nothing
-    ret.failed && throw(ret.result)
-    return Some(ret.result)
 end
 
 # an interrupt can be delivered wherever we yield or hit a safepoint. keep waiting, resuming
-# from where we were, and throw the interrupt once done. cancellation is deferred by running
-# in a shielded scope.
-function wait_uninterrupted(slow_wait::F, state) where {F}
+# from where we were, and throw the first interrupt once done. cancellation is deferred by
+# running in a shielded scope.
+function wait_uninterrupted(slow_wait::F, interrupt) where {F}
     ret = shielded() do
+        first_interrupt = interrupt
+        local ret
         while true
             try
-                return slow_wait()
+                ret = slow_wait()
+                break
             catch err
                 err isa InterruptException || rethrow()
-                state.interrupt === nothing && (state.interrupt = err)
+                first_interrupt === nothing && (first_interrupt = err)
             end
         end
+        first_interrupt === nothing || throw(first_interrupt)
+        return ret
     end
-    state.interrupt === nothing || throw(state.interrupt)
     check_cancelled()
     return ret
 end
