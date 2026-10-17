@@ -244,6 +244,15 @@ end
         @test cooperative_wait(blocking_wait, Operation(); subscribe=immediate) === nothing
         @test subscribed[] == 1
 
+        # completions are reused, so that waiting for one does not allocate (other than to
+        # shield from task cancellation, on Julia 1.14+)
+        if !isdefined(Base, :CANCEL_TOKEN)
+            op = Operation()
+            notified_wait(op) = cooperative_wait(blocking_wait, op; subscribe=immediate)
+            notified_wait(op)
+            @test @allocated(notified_wait(op)) == 0
+        end
+
         # or later, from another thread, while other tasks on this thread keep running
         ticks = Ref(0)
         ticker = @async while ticks[] >= 0
@@ -287,6 +296,30 @@ end
             end
             @test_throws TaskFailedException wait(t)
             @test t.exception isa InterruptException
+        end
+
+        # also when the interrupt arrives while registering, in which case it is deferred
+        # until registration has finished. SIGINT is delivered to the main thread, crashes
+        # Julia 1.12 when it does not exit, and is a cancellation on Julia 1.14+.
+        if Sys.islinux() && Threads.threadid() == 1 && !isdefined(Base, :CANCEL_TOKEN) &&
+           !(v"1.12-" <= VERSION < v"1.13-")
+            registrations = Ref(0)
+            subscribe = function (_, p)
+                registrations[] += 1
+                ccall(:kill, Cint, (Cint, Cint), getpid(), Base.SIGINT)
+                @gcsafe_ccall uv_sleep(100::Cuint)::Cvoid
+                signal_later(p, 200)
+            end
+            Base.exit_on_sigint(false)
+            try
+                t0 = time()
+                @test_throws InterruptException cooperative_wait(blocking_wait, Operation();
+                                                                 subscribe)
+                @test time() - t0 >= 0.3
+                @test registrations[] == 1
+            finally
+                Base.exit_on_sigint(true)
+            end
         end
 
         # the same goes for task cancellation
@@ -388,6 +421,7 @@ end
 
     # a driver thread waiting for the lock lets the garbage collector run
     c = GPUToolbox.Completion()
+    @atomic c.state = GPUToolbox.PENDING
     GC.@preserve c begin
         lock(c.cond)
         signal_later(pointer_from_objref(c), 0)
