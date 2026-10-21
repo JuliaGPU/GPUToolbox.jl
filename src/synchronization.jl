@@ -201,16 +201,32 @@ end
 # immediately takes the lock again. if that task runs on the same CPU, it preempts the
 # driver's thread, and would spin until the OS switches back. when all cores are busy (e.g.,
 # with PoCL executing the next kernel), that can take hundreds of µs.
-struct YieldingSpinLock <: Base.AbstractLock
-    lock::Threads.SpinLock
+#
+# on Julia 1.13+, this reuses Base's spin lock implementation, overriding only `lock`.
+# defining methods like `islocked` or `Base.assert_havelock` (needed to wait on a
+# condition) for a new lock type invalidates the code Base compiled for conditions with an
+# unknown lock type, which then has to be recompiled at exit (in `temp_cleanup_atexit`).
+@static if isdefined(Threads, :AbstractSpinLock)
+    mutable struct YieldingSpinLock <: Threads.AbstractSpinLock
+        @atomic owned::Int      # as expected by the `AbstractSpinLock` methods
+        YieldingSpinLock() = new(0)
+    end
+else
+    struct YieldingSpinLock <: Base.AbstractLock
+        lock::Threads.SpinLock
+    end
+    YieldingSpinLock() = YieldingSpinLock(Threads.SpinLock())
+    Base.trylock(l::YieldingSpinLock) = trylock(l.lock)
+    Base.unlock(l::YieldingSpinLock) = unlock(l.lock)
+    Base.islocked(l::YieldingSpinLock) = islocked(l.lock)
+    Base.assert_havelock(l::YieldingSpinLock) = Base.assert_havelock(l.lock)
 end
-YieldingSpinLock() = YieldingSpinLock(Threads.SpinLock())
 
 const LOCK_SPIN_ITERATIONS = 100
 
 function Base.lock(l::YieldingSpinLock)
     i = 0
-    while !trylock(l.lock)
+    while !trylock(l)
         if i < LOCK_SPIN_ITERATIONS
             ccall(:jl_cpu_pause, Cvoid, ())
             i += 1
@@ -221,10 +237,6 @@ function Base.lock(l::YieldingSpinLock)
     end
     return
 end
-Base.trylock(l::YieldingSpinLock) = trylock(l.lock)
-Base.unlock(l::YieldingSpinLock) = unlock(l.lock)
-Base.islocked(l::YieldingSpinLock) = islocked(l.lock)
-Base.assert_havelock(l::YieldingSpinLock) = Base.assert_havelock(l.lock)
 
 # let the OS run another thread on this CPU
 @static if Sys.iswindows()
