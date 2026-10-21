@@ -397,6 +397,14 @@ function on_foreign_thread(f)
 end
 
 @testset "completion lock" begin
+    l = GPUToolbox.YieldingSpinLock()
+    @test_throws ConcurrencyViolationError Base.assert_havelock(l)
+    @lock l @test Base.assert_havelock(l) === nothing
+    if isdefined(Threads, :AbstractSpinLock)
+        # reuse Base's method, as adding one causes invalidations
+        @test parentmodule(which(Base.assert_havelock, Tuple{typeof(l)})) === Base.Threads
+    end
+
     # a task that is woken up while the notifying thread still holds the lock waits for it
     # to be released
     cond = Base.GenericCondition(GPUToolbox.YieldingSpinLock())
