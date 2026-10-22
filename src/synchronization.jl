@@ -136,7 +136,7 @@ function create_wait_worker(overflow::Bool)
     started = false
     try
         # we don't know what the size of uv_thread_t is, so reserve enough space
-        tid = Ref{NTuple{32, UInt8}}(ntuple(i -> 0, 32))
+        tid = Ref{NTuple{32, UInt8}}(ntuple(i -> 0x00, Val(32)))
 
         cb = @cfunction(wait_worker_loop, Cvoid, (Ptr{Cvoid},))
         err = ccall(:uv_thread_create, Cint, (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
