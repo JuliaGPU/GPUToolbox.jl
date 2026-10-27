@@ -28,6 +28,8 @@ This package currently exports the following:
 
 It also provides `GPUToolbox.Overlays`, method tables with device overrides of Base
 functionality that GPU back-ends can share by stacking them underneath their own method
-table. See the module's docstring for the design and how to use it.
+table, and the tools back-ends use to define device-only functions and to check that no
+device code leaks into code compiled for the host. See the module's docstring for the
+design and how to use it.
 
 For more details on a specific symbol, check out its docstring in the Julia REPL.

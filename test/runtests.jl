@@ -515,6 +515,135 @@ using IOCapture
         @test length(issues) == 3
     end
 
+    @testset "device functions" begin
+        @eval module DeviceFunctionTest
+            using GPUToolbox
+            Base.Experimental.@MethodTable(method_table)
+            macro device_override(ex)
+                esc(GPUToolbox.Overlays.device_override(__module__, :method_table, ex))
+            end
+            macro device_function(ex)
+                esc(GPUToolbox.Overlays.device_function(__module__, :method_table, ex))
+            end
+
+            host(x::Int) = x + 1
+            @device_override host(x::Int) = x + 1
+
+            @device_function single(x::Int) = x + 1
+            @device_function @inline function parametric(x::T) where {T}
+                return x + one(T)
+            end
+            @device_function @generated generated(x) = :(x + 1)
+            # the host method throws, whatever the arguments are called
+            @device_function shadowing(error::Int) = error + 1
+            @device_function begin
+                "documented device function"
+                documented(x::Int) = x + 1
+
+                other(x::Int) = x + 1
+            end
+        end
+        mod = DeviceFunctionTest
+        table = mod.method_table
+        overlay(f, args...) = Base._methods_by_ftype(Tuple{typeof(f), map(typeof, args)...},
+                                                     table, -1, Base.get_world_counter())
+
+        @test mod.host(1) == 2
+        @test length(overlay(mod.host, 1)) == 1
+        for f in (mod.single, mod.parametric, mod.generated, mod.shadowing, mod.documented,
+                  mod.other)
+            @test_throws "not intended for use on the CPU" f(1)
+            matches = overlay(f, 1)
+            @test length(matches) == 1
+            # the overlay has the actual implementation (invoking it requires Julia 1.12)
+            if VERSION >= v"1.12"
+                @test invoke(f, only(matches).method, 1) == 2
+            end
+        end
+        @test occursin("documented device function", string(@doc mod.documented))
+    end
+
+    @testset "host leaks" begin
+        @eval module HostLeakTest
+            using GPUToolbox
+            Base.Experimental.@MethodTable(method_table)
+            macro device_function(ex)
+                esc(GPUToolbox.Overlays.device_function(__module__, :method_table, ex))
+            end
+
+            # declarations of device-only functions, in the forms back-ends use
+            extern() = ccall("extern julia.gpu.state_getter", llvmcall, Int, ())
+            intrinsic() = ccall("llvm.nvvm.read.ptx.sreg.tid.x", llvmcall, Int32, ())
+            declared() = Base.llvmcall(("""
+                declare i64 @julia.opencl.random_keys()
+                define i64 @entry() {
+                    %r = call i64 @julia.opencl.random_keys()
+                    ret i64 %r
+                }""", "entry"), Int64, Tuple{})
+            const IR = ("""
+                declare i64 @julia.opencl.random_keys()
+                define i64 @entry() {
+                    %r = call i64 @julia.opencl.random_keys()
+                    ret i64 %r
+                }""", "entry")
+            constant() = Base.llvmcall(IR, Int64, Tuple{})
+
+            # through calls that aren't inlined, including to a less specific method
+            @noinline callee(x::Int) = x + extern()
+            caller() = callee(1)
+            @noinline target(x) = extern()
+            @noinline target(x::Int) = 0
+            invoker() = invoke(target, Tuple{Any}, 1)
+            # mutual recursion, which is searched starting from either method
+            @noinline recursive_a(n::Int) = n > 0 ? recursive_b(n - 1) : extern()
+            @noinline recursive_b(n::Int) = n > 0 ? recursive_a(n - 1) : 0
+
+            # signatures that Julia compiles after splitting unions, or that are compileable
+            union_split(x::Union{Int32,Int64}) = x isa Int32 ? Int(intrinsic()) : 0
+            abstract_union(x::Union{Int,AbstractString}) = extern()
+            typevar(x::T) where {T<:Union{Int32,Int64}} = extern()
+            dependent(x::T, y::S) where {T<:Union{Int32,Int64}, S<:T} = extern()
+            functional(f::Function) = extern()
+
+            module Submodule
+                import ..extern
+                submodule() = extern()
+            end
+
+            # host code
+            host_intrinsic(x::Int32) = ccall("llvm.ctpop.i32", llvmcall, Int32, (Int32,), x)
+            host_ir(x::Int64) = Base.llvmcall("%r = add i64 %0, 1\nret i64 %r", Int64,
+                                              Tuple{Int64}, x)
+            # not compiled for the host: not compileable, generated, or a device function
+            abstract(x) = extern()
+            @generated generated() = :(extern())
+            @device_function device() = extern()
+        end
+        mod = HostLeakTest
+        leaks = Dict(l.method => l.symbol for l in GPUToolbox.Overlays.host_leaks(mod))
+        state, tid, keys = "julia.gpu.state_getter", "llvm.nvvm.read.ptx.sreg.tid.x",
+                           "julia.opencl.random_keys"
+        expected = Dict(
+            which(mod.extern, Tuple{}) => state,
+            which(mod.intrinsic, Tuple{}) => tid,
+            which(mod.declared, Tuple{}) => keys,
+            which(mod.constant, Tuple{}) => keys,
+            which(mod.callee, Tuple{Int}) => state,
+            which(mod.caller, Tuple{}) => state,
+            which(mod.invoker, Tuple{}) => state,
+            which(mod.recursive_a, Tuple{Int}) => state,
+            which(mod.recursive_b, Tuple{Int}) => state,
+            which(mod.union_split, Tuple{Int32}) => tid,
+            which(mod.abstract_union, Tuple{Int}) => state,
+            which(mod.typevar, Tuple{Int32}) => state,
+            which(mod.dependent, Tuple{Int32, Int32}) => state,
+            which(mod.functional, Tuple{Function}) => state,
+            which(mod.Submodule.submodule, Tuple{}) => state)
+        # Julia 1.10 and 1.11 only find methods of functions bound in the module, which
+        # includes these
+        @test leaks == expected
+    end
+
     # device overrides can be called on the CPU by invoking their method directly, but that
     # requires Julia 1.12. Calls within the overrides then use Base's (host) methods.
     VERSION >= v"1.12" && @testset "device overrides" begin
