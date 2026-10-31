@@ -16,6 +16,26 @@ function blocking_wait(op::Operation)
     return :waited
 end
 
+# an operation that completes at a deadline: a bits type, whose wait returns a value that is
+# boxed when stored untyped
+struct Deadline
+    time::UInt64
+end
+Deadline(secs::Real) = Deadline(time_ns() + round(UInt64, secs * 1e9))
+passed(d::Deadline) = time_ns() >= d.time
+function sleep_until(d::Deadline)
+    while !passed(d)
+        @gcsafe_ccall uv_sleep(1::Cuint)::Cvoid
+    end
+    return d.time
+end
+
+# the same wait, returning a bits type
+flag_wait(op::Operation) = blocking_wait(op) === :waited
+
+# redefined during a wait, to return something else
+changing_wait(_) = :before
+
 function short_waits()
     for _ in 1:10
         cooperative_wait(blocking_wait, complete_after!(Operation(), 0.001); isdone)
@@ -68,6 +88,22 @@ end
         @test @allocated(fast_wait(op)) == 0
     end
 
+    # nor on a worker, which reuses the requests it is handed, for objects that are bits
+    # types or mutable objects, and results that are bits types
+    if !isdefined(Base, :CANCEL_TOKEN)
+        worker_wait(d) = cooperative_wait(sleep_until, d; isdone=passed, spin=false)
+        worker_wait(Deadline(1e-3))
+        d = Deadline(1e-3)
+        @test @allocated(worker_wait(d)) == 0
+        @test worker_wait(d) == Some(d.time)
+
+        op = complete!(Operation())
+        mutable_wait(op) = cooperative_wait(flag_wait, op; isdone, spin=false)
+        mutable_wait(op)
+        @test @allocated(mutable_wait(op)) == 0
+        @test mutable_wait(op) == Some(true)
+    end
+
     # other tasks on this thread keep running while waiting on a worker
     for polled in (false, true)
         op = complete_after!(Operation(), 30)   # in case the thread is blocked
@@ -94,6 +130,19 @@ end
     # functions defined after the workers were started can be used
     f = @eval _ -> :new_function
     @test cooperative_wait(f, nothing) == Some(:new_function)
+
+    # the worker calls the latest method, while the caller expects the result of the one it
+    # was compiled with: a wait function redefined to return something else during the wait
+    # is an error
+    let redefined = Ref(false)
+        function redefining_isdone(_)
+            redefined[] || (redefined[] = true; @eval changing_wait(_) = "after")
+            return false
+        end
+        @test_throws "redefined" cooperative_wait(changing_wait, nothing;
+                                                  isdone=redefining_isdone)
+        @test redefined[]
+    end
 
     # a long wait does not delay other ones, even with more waits than worker threads
     for polled in (false, true)

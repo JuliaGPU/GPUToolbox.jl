@@ -65,15 +65,41 @@ end
 # deadlock if what the finalizer waits for depends on that. finalizers that become pending
 # on a worker thread (e.g., when it triggers a collection) run on another thread instead.
 
-mutable struct WaitRequest
-    const wait::Any
-    const obj::Any
-    const done::Base.Event
-    result::Any
-    failed::Bool
+# requests are reused, so that waiting on a worker does not allocate. a request is typed by
+# the function, the object and the result of its wait, so that handing these over boxes
+# nothing (when they are bits types or mutable objects), and every type has a pool of its
+# own. a request goes back to its pool once its waiter is done with it: the waiter has seen
+# the worker finish, or polling found the object completed before any worker took it. a
+# request left behind by an interrupted cancellable wait is still in use by its worker, and
+# is not reused.
+mutable struct WaitRequest{W,O,R}
+    wait::Union{Nothing,W}
+    obj::Union{Nothing,O}
+    result::Union{Nothing,R}
+    failure::Any        # what `wait` threw, if anything
+    const done::Base.Event      # autoreset
     submitted::Bool     # whether a worker has been handed the request
 
-    WaitRequest(wait, obj) = new(wait, obj, Base.Event(), nothing, false, false)
+    WaitRequest{W,O,R}() where {W,O,R} =
+        new(nothing, nothing, nothing, nothing, Base.Event(true), false)
+end
+
+# runs on a worker, in the latest world, while the request was typed by its caller in the
+# world it runs in. a result of another type means `wait` was redefined in between.
+function perform!(request::WaitRequest{W,O,R}) where {W,O,R}
+    try
+        result = (request.wait::W)(request.obj::O)
+        if result isa R
+            request.result = result
+        else
+            request.failure = ErrorException("waiting returned a $(typeof(result)), where " *
+                                             "its caller expects a $R; was the wait " *
+                                             "function redefined during the wait?")
+        end
+    catch err
+        request.failure = err
+    end
+    return
 end
 
 mutable struct WaitWorker
@@ -91,10 +117,31 @@ const overflow_wait_workers = WaitWorker[]
 # idle workers
 const idle_wait_workers = WaitWorker[]
 const idle_overflow_wait_workers = WaitWorker[]
+# idle requests, by type
+const request_pools = IdDict{DataType,Vector}()
+# protects the workers and the requests they are handed
 const wait_worker_lock = ReentrantLock()
 
 # how long to poll before checking again whether a worker has become available
 const POLL_RETRY_NS = 100_000
+
+function acquire_request(::Type{T}) where {T<:WaitRequest}
+    @lock wait_worker_lock begin
+        pool = get(request_pools, T, nothing)::Union{Nothing,Vector{T}}
+        pool === nothing || isempty(pool) || return pop!(pool)
+    end
+    return T()
+end
+
+function release_request(request::T) where {T<:WaitRequest}
+    request.wait = nothing
+    request.obj = nothing
+    request.result = nothing
+    request.failure = nothing
+    request.submitted = false
+    @lock wait_worker_lock push!(get!(Vector{T}, request_pools, T)::Vector{T}, request)
+    return
+end
 
 function wait_worker_loop(data::Ptr{Cvoid})
     worker = unsafe_pointer_to_objref(data)::WaitWorker
@@ -106,13 +153,8 @@ function wait_worker_loop(data::Ptr{Cvoid})
         request = worker.request::WaitRequest
         worker.request = nothing
 
-        try
-            # the worker was started in an older world
-            request.result = Base.invokelatest(request.wait, request.obj)
-        catch err
-            request.result = err
-            request.failed = true
-        end
+        # the worker was started in an older world
+        Base.invokelatest(perform!, request)
 
         # become available before waking the caller, so that it finds this worker when it
         # immediately waits again
@@ -427,6 +469,10 @@ block for long (it may have to wait for the notification callback to return), an
 still be needed, e.g., to synchronize memory or to check for errors. Errors thrown by
 `wait`, `subscribe` or `isdone` are rethrown.
 
+Waiting does not allocate when polling or a notification finds `obj` completed. Neither does
+waiting on a worker, as long as `wait` and `obj` are bits types or mutable objects, and
+`wait(obj)` is inferred to return a bits type; anything else is boxed to be handed over.
+
 If the wait is interrupted (i.e., an `InterruptException` is thrown) or the task is
 cancelled, the default is to keep waiting, and only throw once `obj` has completed: the
 operation may be using memory that the caller would release when unwinding. Note that
@@ -436,9 +482,9 @@ immediately, while the operation may still be executing.
 In finalizers, where it is not possible to switch tasks, and while generating output (e.g.,
 during precompilation), `wait(obj)` is called on the calling thread instead.
 """
-function cooperative_wait(wait::W, obj; subscribe::S=nothing, isdone::D=nothing,
+function cooperative_wait(wait::W, obj::O; subscribe::S=nothing, isdone::D=nothing,
                           spin::Union{Bool,Real}=true,
-                          cancellable::Bool=false) where {W,S,D}
+                          cancellable::Bool=false) where {W,O,S,D}
     spin isa Bool || spin >= 0 || throw(ArgumentError("spin duration must be non-negative"))
     if GC.in_finalizer() || generating_output()
         return Some(wait(obj))
@@ -470,12 +516,18 @@ function cooperative_wait(wait::W, obj; subscribe::S=nothing, isdone::D=nothing,
 
     # slow path: wait for a completion notification, or hand the wait to a worker thread
     if subscribe === nothing
-        request = WaitRequest(wait, obj)
+        R = Base.promote_op(wait, O)
+        request = acquire_request(WaitRequest{W,O,R})
+        request.wait = wait
+        request.obj = obj
         slow_wait = () -> wait_cooperatively(request, obj, isdone)
         polled = cancellable ? slow_wait() : wait_uninterrupted(slow_wait, interrupt)
+        # the worker is done with the request, or never had it
+        failure, result = request.failure, request.result
+        release_request(request)
         polled && return nothing
-        request.failed && throw(request.result)
-        return Some(request.result)
+        failure === nothing || throw(failure)
+        return Some(result::R)
     else
         c = acquire_completion()
         try
