@@ -16,6 +16,62 @@ function blocking_wait(op::Operation)
     return :waited
 end
 
+# bits-type argument and result, both of which would be boxed by an untyped request
+struct Deadline
+    time::UInt64
+end
+Deadline(secs::Real) = Deadline(time_ns() + round(UInt64, secs * 1e9))
+passed(d::Deadline) = time_ns() >= d.time
+function sleep_until(d::Deadline)
+    while !passed(d)
+        @gcsafe_ccall uv_sleep(1::Cuint)::Cvoid
+    end
+    return d.time
+end
+
+# the same wait, like CUDA.jl's: on an immutable object containing references, returning a
+# status code (whose boxes, unlike those of small integers, are not cached)
+primitive type Status 32 end
+const WAITED = reinterpret(Status, Int32(0))
+const wait_context = Ref(0)
+status_wait((op, _)) = (blocking_wait(op); WAITED)
+status_isdone((op, _)) = isdone(op)
+
+worker_wait(d::Deadline) = cooperative_wait(sleep_until, d; isdone=passed, spin=false)
+# not inlined, so that the result is returned (as with CUDA.jl's `synchronize`)
+@noinline tuple_wait(op::Operation) =
+    cooperative_wait(status_wait, (op, wait_context); isdone=status_isdone, spin=false)
+
+# create deadlines after compilation, so measurements include actual blocking waits
+Base.@constprop :none function worker_wait_allocations(n)
+    bytes = 0
+    for _ in 1:n
+        d = Deadline(1e-3)
+        bytes += @allocated worker_wait(d)
+    end
+    return bytes
+end
+
+Base.@constprop :none function tuple_wait_allocations(op, n)
+    bytes = 0
+    for _ in 1:n
+        bytes += @allocated something(tuple_wait(op), WAITED)::Status
+    end
+    return bytes
+end
+
+# a wait whose function, object and result are immutable but contain references
+@noinline function pooled_wait_weakrefs()
+    owner, obj = Ref(0), Ref(0)
+    refs = (WeakRef(owner), WeakRef(obj))
+    wait = ((o, _),) -> (owner[] += o[]; (owner, 1))
+    @test cooperative_wait(wait, (obj, 1); spin=false) == Some((owner, 1))
+    return refs
+end
+
+# redefined during a wait, to return something else
+changing_wait(_) = :before
+
 function short_waits()
     for _ in 1:10
         cooperative_wait(blocking_wait, complete_after!(Operation(), 0.001); isdone)
@@ -50,6 +106,35 @@ function signal_later(payload, ms)
     return
 end
 
+# run `f` on a thread that is not managed by Julia
+mutable struct ForeignCall
+    const f::Any
+    @atomic done::Bool
+    @atomic failed::Bool
+end
+const foreign_calls = ForeignCall[]     # keep them alive
+function foreign_call(arg::Ptr{Cvoid})
+    call = unsafe_pointer_to_objref(arg)::ForeignCall
+    try
+        call.f()
+    catch
+        @atomic call.failed = true
+    end
+    @atomic call.done = true
+    return
+end
+function on_foreign_thread(f)
+    call = ForeignCall(f, false, false)
+    push!(foreign_calls, call)
+    tid = Ref{NTuple{32, UInt8}}(ntuple(_ -> 0x0, 32))
+    cb = @cfunction(foreign_call, Cvoid, (Ptr{Cvoid},))
+    err = ccall(:uv_thread_create, Cint, (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
+                tid, cb, pointer_from_objref(call))
+    @test err == 0
+    ccall(:uv_thread_detach, Cint, (Ptr{Cvoid},), tid)
+    return call
+end
+
 @testset "cooperative_wait" begin
     # completed operations are detected by polling
     @test cooperative_wait(blocking_wait, complete!(Operation()); isdone) === nothing
@@ -66,6 +151,20 @@ end
         fast_wait(op) = cooperative_wait(blocking_wait, op; isdone)
         fast_wait(op)
         @test @allocated(fast_wait(op)) == 0
+    end
+
+    # requests are reused, so that waiting on a worker does not allocate either, also
+    # not to box the object or the result
+    if !isdefined(Base, :CANCEL_TOKEN)
+        worker_wait_allocations(4)
+        op = complete!(Operation())
+        tuple_wait_allocations(op, 4)
+        # the scheduler can allocate when the thread goes idle, so take the best batch
+        @test minimum(worker_wait_allocations(32) for _ in 1:5) == 0
+        @test minimum(tuple_wait_allocations(op, 32) for _ in 1:5) == 0
+        d = Deadline(1e-3)
+        @test worker_wait(d) == Some(d.time)
+        @test tuple_wait(op) === Some(WAITED)
     end
 
     # other tasks on this thread keep running while waiting on a worker
@@ -91,9 +190,68 @@ end
     @test_throws ErrorException("oops") cooperative_wait(blocking_wait, Operation();
                                                          isdone=_ -> error("oops"))
 
+    # an interrupt after the worker signalled the request resumes waiting, which returns
+    # immediately
+    let T = GPUToolbox.WaitRequest{typeof(identity),Nothing,Nothing},
+        request = GPUToolbox.acquire_request(T),
+        attempts = 0
+        request.submitted = true
+        notify(request.done)
+        interrupted_wait = function ()
+            GPUToolbox.wait_cooperatively(request, nothing, nothing)
+            attempts += 1
+            attempts == 1 && throw(InterruptException())
+        end
+        t = @async GPUToolbox.wait_uninterrupted(interrupted_wait, nothing)
+        finished = timedwait(() -> istaskdone(t), 10) === :ok
+        @test finished
+        finished || notify(request.done)
+        @test_throws TaskFailedException wait(t)
+        @test t.exception isa InterruptException
+        @test attempts == 2
+        GPUToolbox.release_request(request)
+    end
+
+    # reused requests do not carry over a previous result or exception
+    let value = Ref{Any}(:success)
+        maybe_fail = _ -> value[] === :success ? :waited : throw(value[])
+        value[] = nothing
+        @test_throws Nothing cooperative_wait(maybe_fail, nothing; spin=false)
+        value[] = :success
+        @test cooperative_wait(maybe_fail, nothing; spin=false) === Some(:waited)
+        value[] = false
+        @test_throws Bool cooperative_wait(maybe_fail, nothing; spin=false)
+        value[] = :success
+        @test cooperative_wait(maybe_fail, nothing; spin=false) === Some(:waited)
+    end
+
+    for value in (nothing, UInt64(0xf123456789abcdef), "result", Ref(1), (Ref(1), 2))
+        @test something(cooperative_wait(identity, value; spin=false)) === value
+    end
+
+    # idle requests do not keep the function, the object or the result alive
+    refs = pooled_wait_weakrefs()
+    GC.gc()
+    @test all(r -> r.value === nothing, refs)
+
     # functions defined after the workers were started can be used
     f = @eval _ -> :new_function
     @test cooperative_wait(f, nothing) == Some(:new_function)
+
+    # the function is called in the caller's world, like a direct call would be
+    let redefined = Ref(false), world = Base.get_world_counter()
+        function redefining_isdone(_)
+            redefined[] || (redefined[] = true; @eval changing_wait(_) = :after)
+            return false
+        end
+        @test cooperative_wait(changing_wait, nothing; isdone=redefining_isdone) ==
+              Some(:before)
+        @test redefined[]
+        # also when requests are reused across worlds
+        @test Base.invokelatest(cooperative_wait, changing_wait, nothing) == Some(:after)
+        @test Base.invoke_in_world(world, cooperative_wait, changing_wait, nothing) ==
+              Some(:before)
+    end
 
     # a long wait does not delay other ones, even with more waits than worker threads
     for polled in (false, true)
@@ -201,6 +359,40 @@ end
         end
         @test_throws TaskFailedException wait(t)
         @test t.exception isa InterruptException
+    end
+
+    # and for interrupts while spinning on the lock of the request pool (see below for the
+    # conditions under which SIGINT can be tested)
+    if Sys.islinux() && Threads.threadid() == 1 && !isdefined(Base, :CANCEL_TOKEN) &&
+       !(v"1.12-" <= VERSION < v"1.13-")
+        Base.exit_on_sigint(false)
+        acquiring = Threads.Atomic{Bool}(false)
+        holder = nothing
+        try
+            holder = on_foreign_thread() do
+                @lock GPUToolbox.request_pool_lock begin
+                    while !acquiring[]
+                        @gcsafe_ccall uv_sleep(1::Cuint)::Cvoid
+                    end
+                    # give the main thread time to start spinning on the lock
+                    @gcsafe_ccall uv_sleep(100::Cuint)::Cvoid
+                    ccall(:kill, Cint, (Cint, Cint), getpid(), Base.SIGINT)
+                    @gcsafe_ccall uv_sleep(100::Cuint)::Cvoid
+                end
+            end
+            @test timedwait(() -> islocked(GPUToolbox.request_pool_lock), 30) === :ok
+            op = complete_after!(Operation(), 0.5)
+            @test_throws InterruptException begin
+                acquiring[] = true
+                cooperative_wait(blocking_wait, op; spin=false)
+            end
+            @test isdone(op)
+        finally
+            acquiring[] = true
+            @test timedwait(() -> @atomic(holder.done), 30) === :ok
+            @test !@atomic(holder.failed)
+            Base.exit_on_sigint(true)
+        end
     end
 
     # the same goes for task cancellation
@@ -365,35 +557,6 @@ end
     finalized_object()
     GC.gc(); GC.gc()
     @test isassigned(ret) && ret[] == Some(:waited)
-end
-
-# run `f` on a thread that is not managed by Julia
-mutable struct ForeignCall
-    const f::Any
-    @atomic done::Bool
-    @atomic failed::Bool
-end
-const foreign_calls = ForeignCall[]     # keep them alive
-function foreign_call(arg::Ptr{Cvoid})
-    call = unsafe_pointer_to_objref(arg)::ForeignCall
-    try
-        call.f()
-    catch
-        @atomic call.failed = true
-    end
-    @atomic call.done = true
-    return
-end
-function on_foreign_thread(f)
-    call = ForeignCall(f, false, false)
-    push!(foreign_calls, call)
-    tid = Ref{NTuple{32, UInt8}}(ntuple(_ -> 0x0, 32))
-    cb = @cfunction(foreign_call, Cvoid, (Ptr{Cvoid},))
-    err = ccall(:uv_thread_create, Cint, (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
-                tid, cb, pointer_from_objref(call))
-    @test err == 0
-    ccall(:uv_thread_detach, Cint, (Ptr{Cvoid},), tid)
-    return call
 end
 
 @testset "completion lock" begin
