@@ -112,9 +112,9 @@ const TWO_PI_HI = 6.2831855f0 # above 2π, so smaller values need no reduction
 const TWO_PI_LO = -1.7484555f-7
 const PI_HI = 3.1415927f0 # above π, so smaller values need no reduction
 
-# The fractional part of `x / 2π` for finite `x >= 1`, as a 96-bit fixed-point number. As
-# `x / 2π` can be within 2^-30 of an integer and the 24-bit `m` scales the window's truncation
-# error, a 64-bit window would not leave enough accurate bits.
+# The fractional part of `x / 2π` for finite `x >= 1`, in 64-bit fixed point. `x / 2π` can be
+# as close as 2^-29.9 to an integer, and the 24-bit `m` scales the truncation error of the
+# window of `1/2π`, so the window spans 96 bits; the high 64 bits of the product suffice.
 @inline function frac_over_2pi(x::Float32)
     u = reinterpret(UInt32, x)
     m = (u & 0x007fffff) | 0x00800000
@@ -129,15 +129,13 @@ const PI_HI = 3.1415927f0 # above π, so smaller values need no reduction
     p0 = UInt64(m) * (w & 0xffffffff)
     p1 = UInt64(m) * (w >> 32) + (p0 >> 32)
     p2 = m * top + (p1 >> 32) % UInt32
-    return (UInt64(p2) << 32) | (p1 & 0xffffffff), p0 % UInt32
+    return (UInt64(p2) << 32) | (p1 & 0xffffffff)
 end
 
-@inline negate_frac(hi::UInt64, lo::UInt32) = ~hi + iszero(lo), -lo
-
-# `2π * (hi, lo) / 2^96`. At least 2^-30, so `hi` is never zero and the result is normal.
-@inline function frac_times_2pi(hi::UInt64, lo::UInt32)
-    lz = leading_zeros(hi) % UInt32
-    n = (hi << lz) | ((UInt64(lo) << 32) >> (0x00000040 - lz))
+# `2π * f / 2^64`. At least 2^-30, so `f` is never zero and the result is normal.
+@inline function frac_times_2pi(f::UInt64)
+    lz = leading_zeros(f) % UInt32
+    n = f << lz
     # high half of `n` times π * 2^62, ignoring the product of the low words
     n1, n0 = n >> 32, n & 0xffffffff
     p = n1 * 0xc90fdaa2 + ((n1 * 0x2168c235) >> 32) + ((n0 * 0xc90fdaa2) >> 32)
@@ -149,23 +147,23 @@ end
     x === -0f0 && return x
     if signbit(x)
         x > -1f0 && return TWO_PI_HI + (x + TWO_PI_LO)
-        return frac_times_2pi(negate_frac(frac_over_2pi(-x)...)...)
+        return frac_times_2pi(-frac_over_2pi(-x))
     else
         x < TWO_PI_HI && return x
-        return frac_times_2pi(frac_over_2pi(x)...)
+        return frac_times_2pi(frac_over_2pi(x))
     end
 end
 @float64_override Base.rem2pi(x::Float32, ::RoundingMode{:Up}) = -rem2pi(-x, RoundDown)
 @float64_override function Base.rem2pi(x::Float32, ::RoundingMode{:ToZero})
     isfinite(x) || return x - x
     abs(x) < TWO_PI_HI && return x
-    return copysign(frac_times_2pi(frac_over_2pi(abs(x))...), x)
+    return copysign(frac_times_2pi(frac_over_2pi(abs(x))), x)
 end
 @float64_override function Base.rem2pi(x::Float32, ::RoundingMode{:Nearest})
     isfinite(x) || return x - x
     abs(x) < PI_HI && return x
-    hi, lo = frac_over_2pi(abs(x))
-    y = hi >> 63 == 0 ? frac_times_2pi(hi, lo) : -frac_times_2pi(negate_frac(hi, lo)...)
+    f = frac_over_2pi(abs(x))
+    y = f >> 63 == 0 ? frac_times_2pi(f) : -frac_times_2pi(-f)
     return flipsign(y, x)
 end
 for R in (:Down, :Up, :ToZero, :Nearest)
