@@ -102,6 +102,77 @@ end
 # back-end is expected to override).
 @float64_override Base.sincospi(x::Float32) = (sinpi(x), cospi(x))
 
+# math.jl: `rem2pi` reduces Float32 and Float16 arguments in Float64. Compute the fractional
+# part of `x / 2π` in fixed point instead (Payne-Hanek), which stays accurate up to
+# `floatmax(Float32)`. Writing `x = m * 2^e`, the bits of `1/2π` above `2^-e` only add integers
+# to the quotient, so a window of them suffices. Below 1, where the window would have to start
+# further down, no reduction is needed. Testing the sign on the bits keeps subnormals correct
+# on devices that flush them.
+const TWO_PI_HI = 6.2831855f0 # above 2π, so smaller values need no reduction
+const TWO_PI_LO = -1.7484555f-7
+const PI_HI = 3.1415927f0 # above π, so smaller values need no reduction
+
+# The fractional part of `x / 2π` for finite `x >= 1`, as a 96-bit fixed-point number. As
+# `x / 2π` can be within 2^-30 of an integer and the 24-bit `m` scales the window's truncation
+# error, a 64-bit window would not leave enough accurate bits.
+@inline function frac_over_2pi(x::Float32)
+    u = reinterpret(UInt32, x)
+    m = (u & 0x007fffff) | 0x00800000
+    s = 0x000000fe - (u >> 23)
+    # 64-bit limbs of 2^200 / 2π, least significant first
+    a, b, c = s < 0x00000040 ?
+        (0xd8a5664f10e4107f, 0x09d5f47d4d377036, 0xbe60db9391054a7f) :
+        (0x09d5f47d4d377036, 0xbe60db9391054a7f, 0x0000000000000028)
+    r = s & 0x0000003f
+    w = (a >> r) | (b << (0x00000040 - r))
+    top = ((b >> r) | (c << (0x00000040 - r))) % UInt32
+    p0 = UInt64(m) * (w & 0xffffffff)
+    p1 = UInt64(m) * (w >> 32) + (p0 >> 32)
+    p2 = m * top + (p1 >> 32) % UInt32
+    return (UInt64(p2) << 32) | (p1 & 0xffffffff), p0 % UInt32
+end
+
+@inline negate_frac(hi::UInt64, lo::UInt32) = ~hi + iszero(lo), -lo
+
+# `2π * (hi, lo) / 2^96`. At least 2^-30, so `hi` is never zero and the result is normal.
+@inline function frac_times_2pi(hi::UInt64, lo::UInt32)
+    lz = leading_zeros(hi) % UInt32
+    n = (hi << lz) | ((UInt64(lo) << 32) >> (0x00000040 - lz))
+    # high half of `n` times π * 2^62, ignoring the product of the low words
+    n1, n0 = n >> 32, n & 0xffffffff
+    p = n1 * 0xc90fdaa2 + ((n1 * 0x2168c235) >> 32) + ((n0 * 0xc90fdaa2) >> 32)
+    return Float32(p) * reinterpret(Float32, (0x00000042 - lz) << 23)
+end
+
+@float64_override function Base.rem2pi(x::Float32, ::RoundingMode{:Down})
+    isfinite(x) || return x - x
+    x === -0f0 && return x
+    if signbit(x)
+        x > -1f0 && return TWO_PI_HI + (x + TWO_PI_LO)
+        return frac_times_2pi(negate_frac(frac_over_2pi(-x)...)...)
+    else
+        x < TWO_PI_HI && return x
+        return frac_times_2pi(frac_over_2pi(x)...)
+    end
+end
+@float64_override Base.rem2pi(x::Float32, ::RoundingMode{:Up}) = -rem2pi(-x, RoundDown)
+@float64_override function Base.rem2pi(x::Float32, ::RoundingMode{:ToZero})
+    isfinite(x) || return x - x
+    abs(x) < TWO_PI_HI && return x
+    return copysign(frac_times_2pi(frac_over_2pi(abs(x))...), x)
+end
+@float64_override function Base.rem2pi(x::Float32, ::RoundingMode{:Nearest})
+    isfinite(x) || return x - x
+    abs(x) < PI_HI && return x
+    hi, lo = frac_over_2pi(abs(x))
+    y = hi >> 63 == 0 ? frac_times_2pi(hi, lo) : -frac_times_2pi(negate_frac(hi, lo)...)
+    return flipsign(y, x)
+end
+for R in (:Down, :Up, :ToZero, :Nearest)
+    @eval @float64_override Base.rem2pi(x::Float16, r::RoundingMode{$(QuoteNode(R))}) =
+        Float16(rem2pi(Float32(x), r))
+end
+
 # complex.jl: single-precision complex numbers are divided and inverted in double precision.
 # Divide with the robust algorithm Base uses for ComplexF64 instead (Baudin & Smith, 2012),
 # but scale large divisors further so that the reciprocal of their magnitude isn't subnormal

@@ -708,6 +708,20 @@ using IOCapture
 
         @test override(sincospi, 0.25f0) == (sinpi(0.25f0), cospi(0.25f0))
 
+        @testset "rem2pi" begin
+            # includes the closest Float32 to a multiple of 2π, and values around each threshold
+            xs = Float32[0, -0.0, 1f-40, -1f-40, 1f-30, -1f-30, 0.1, -0.1, 0.99999994, -0.99999994,
+                         1, -1, 3.1415925, -3.1415925, 3.1415927, -3.1415927, 6.283185, -6.283185,
+                         6.2831855, -6.2831855, 7, -7, 12.566371, -12.566371, 1f6, -1f6, 1f20,
+                         3.0916716f29, -3.0916716f29, floatmax(Float32), -floatmax(Float32),
+                         NaN, Inf, -Inf]
+            for r in (RoundDown, RoundUp, RoundToZero, RoundNearest), x in xs
+                @test ulps(override(rem2pi, x, r), rem2pi(Float64(x), r)) <= 1
+            end
+            @test override(rem2pi, -0f0, RoundDown) === -0f0
+            @test override(rem2pi, 1f-40, RoundToZero) === 1f-40
+        end
+
         @testset "complex division" begin
             zs = ComplexF32[1 + 2im, -3f20 + 1f-20im, 2f38 + 2f38im, 1f-30 - 3f-30im, 1f-20 + 1im,
                             0x1p64, complex(0x1p-64, 0x1p-64), 1f-10]
