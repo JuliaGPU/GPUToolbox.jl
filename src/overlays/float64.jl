@@ -86,17 +86,41 @@ end
 @float64_override Base.Math._hypot(x::Float32, y::Float32) =
     invoke(Base.Math._hypot, Tuple{Any,Any}, x, y)
 
-# special/trig.jl: `sind` and friends reduce their argument to [-45°, 45°] in Float32, but
-# convert it to radians and evaluate the sine and cosine kernels in Float64. Keep the
-# reduction, and wrap the converted argument so that the kernels use `sin` and `cos`.
+# special/trig.jl: `sind` and friends convert their argument to radians and evaluate the sine
+# and cosine kernels in Float64. Reduce the argument to [-45°, 45°] in Float32, and wrap the
+# converted argument so that the kernels use `sin` and `cos`.
 struct Radians32
     x::Float32
 end
 # π/180 split into a Float32 value and the remainder
-@float64_override Base.Math.deg2rad_ext(x::Float32) =
-    Radians32(muladd(x, 0.017453292f0, x * 1.3519961f-10))
-@float64_override Base.Math.sin_kernel(y::Radians32) = sin(y.x)
-@float64_override Base.Math.cos_kernel(y::Radians32) = cos(y.x)
+@inline deg2rad32(x::Float32) = Radians32(muladd(x, 0.017453292f0, x * 1.3519961f-10))
+@static if VERSION >= v"1.15.0-DEV.482"
+    # JuliaLang/julia#63544: the reduction returns the angle in sixteenths of a half turn, as
+    # `π/16 * n` plus a remainder, which is computed in Float64 for Float32. Reduce to a
+    # multiple of 90° instead (so `n` is a multiple of 8), which is exact after the reduction
+    # by 360°, and rotate the kernel's results by the quadrant.
+    @float64_override function Base.Math.rem_deg16(a::Float32)
+        a = rem(a, 360f0)
+        q = round(a / 90f0)
+        return deg2rad32(a - 90f0 * q), 8 * unsafe_trunc(Int64, q)
+    end
+    @float64_override function Base.Math.sincos16_kernel(y::Radians32, n::Int64)
+        s, c = sin(y.x), cos(y.x)
+        q = (n >> 3) & 3
+        s0 = q == 1 ? 1f0 : q == 3 ? -1f0 : 0f0
+        c0 = q == 0 ? 1f0 : q == 2 ? -1f0 : 0f0
+        # products with the exact s0 and c0 give zeros the same signs as Base
+        return s * c0 + c * s0, c * c0 - s * s0
+    end
+    @float64_override function Base.Math.tan16(y::Radians32, n::Int64)
+        s, c = Base.Math.sincos16_kernel(y, n)
+        return s / c
+    end
+else
+    @float64_override Base.Math.deg2rad_ext(x::Float32) = deg2rad32(x)
+    @float64_override Base.Math.sin_kernel(y::Radians32) = sin(y.x)
+    @float64_override Base.Math.cos_kernel(y::Radians32) = cos(y.x)
+end
 
 # special/trig.jl: `sincospi` uses Float64 kernels (as do `sinpi` and `cospi`, which the
 # back-end is expected to override).

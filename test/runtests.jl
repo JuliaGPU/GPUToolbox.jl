@@ -699,10 +699,24 @@ using IOCapture
 
         # the kernels used by `sind` and friends, on the converted argument
         @testset "degree trigonometry" begin
-            for x in (0.001f0, 1f0, 30f0, 44.99f0, -45f0)
-                y = override(Base.Math.deg2rad_ext, x)
-                @test ulps(override(Base.Math.sin_kernel, y), sind(big(x))) <= 1
-                @test ulps(override(Base.Math.cos_kernel, y), cosd(big(x))) <= 1
+            if VERSION >= v"1.15.0-DEV.482"
+                # the kernels on the reduced argument, which is |x|; includes zeros of sind
+                # and cosd, whose signs have to match Base's
+                for x in (0f0, 0.001f0, 1f0, 30f0, 44.99f0, 45f0, 90f0, 135f0, 180f0, 269f0,
+                          270f0, 359.9f0, 360f0, 1f10, floatmax(Float32))
+                    s, c = override(Base.Math.sincos16_kernel,
+                                    override(Base.Math.rem_deg16, x)...)
+                    @test ulps(s, sind(big(x))) <= 1
+                    @test ulps(c, cosd(big(x))) <= 1
+                    ref = Base.Math.sincos16_kernel(Base.Math.rem_deg16(x)...)
+                    @test signbit.((s, c)) == signbit.(ref)
+                end
+            else
+                for x in (0.001f0, 1f0, 30f0, 44.99f0, -45f0)
+                    y = override(Base.Math.deg2rad_ext, x)
+                    @test ulps(override(Base.Math.sin_kernel, y), sind(big(x))) <= 1
+                    @test ulps(override(Base.Math.cos_kernel, y), cosd(big(x))) <= 1
+                end
             end
         end
 
