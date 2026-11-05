@@ -65,15 +65,44 @@ end
 # deadlock if what the finalizer waits for depends on that. finalizers that become pending
 # on a worker thread (e.g., when it triggers a collection) run on another thread instead.
 
-mutable struct WaitRequest
-    const wait::Any
-    const obj::Any
+# requests are reused, so that waiting on a worker does not allocate. they are typed by the
+# function, the object and the inferred result type, so that those are not boxed either. to
+# make that type exact, the worker calls `wait` in the caller's world, like a direct call.
+# the arguments and the result are kept in vectors, which store immutable values inline
+# (unlike a `Union{Nothing,T}` field when `T` contains references), and are emptied when the
+# request is released, so that idle requests do not keep the driver's objects alive.
+#
+# only the caller releases a request, once the worker has signalled it (its last access to
+# the request), or when polling found the object to have completed before submitting it.
+# requests of interrupted or cancelled waits are not reused.
+mutable struct WaitRequest{W,O,R}
+    const call::Vector{Tuple{W,O}}  # `(wait, obj)`, while in use
+    const result::Vector{R}         # empty if `wait` threw
+    exception::Any
+    world::Any                      # boxed, as passed to `Core._call_in_world`
     const done::Base.Event
-    result::Any
-    failed::Bool
-    submitted::Bool     # whether a worker has been handed the request
+    submitted::Bool                 # whether a worker has been handed the request
 
-    WaitRequest(wait, obj) = new(wait, obj, Base.Event(), nothing, false, false)
+    WaitRequest{W,O,R}() where {W,O,R} =
+        new(sizehint!(Tuple{W,O}[], 1), sizehint!(R[], 1), nothing, nothing, Base.Event(),
+            false)
+end
+
+function perform!(request::WaitRequest{W,O,R}) where {W,O,R}
+    wait, obj = request.call[1]
+    try
+        # inferred in the same world, so this only fails if inference is wrong
+        push!(request.result, wait(obj)::R)
+    catch err
+        request.exception = err
+    end
+    return
+end
+
+@static if isdefined(Base, :tls_world_age)
+    tls_world_age() = Base.tls_world_age()
+else
+    tls_world_age() = ccall(:jl_get_tls_world_age, UInt, ())
 end
 
 mutable struct WaitWorker
@@ -93,8 +122,31 @@ const idle_wait_workers = WaitWorker[]
 const idle_overflow_wait_workers = WaitWorker[]
 const wait_worker_lock = ReentrantLock()
 
+# idle requests, by type. the values are untyped, as checking them against `Vector` (a
+# `UnionAll`) is much slower than against the expected `Vector{T}`.
+const request_pools = IdDict{DataType,Any}()
+const request_pool_lock = Threads.SpinLock()
+
 # how long to poll before checking again whether a worker has become available
 const POLL_RETRY_NS = 100_000
+
+function acquire_request(::Type{T}) where {T<:WaitRequest}
+    @lock request_pool_lock begin
+        pool = get(request_pools, T, nothing)
+        pool isa Vector{T} && !isempty(pool) && return pop!(pool)
+    end
+    return T()
+end
+
+function release_request(request::T) where {T<:WaitRequest}
+    empty!(request.call)
+    empty!(request.result)
+    request.exception = nothing
+    request.submitted = false
+    reset(request.done)
+    @lock request_pool_lock push!(get!(Vector{T}, request_pools, T)::Vector{T}, request)
+    return
+end
 
 function wait_worker_loop(data::Ptr{Cvoid})
     worker = unsafe_pointer_to_objref(data)::WaitWorker
@@ -106,13 +158,7 @@ function wait_worker_loop(data::Ptr{Cvoid})
         request = worker.request::WaitRequest
         worker.request = nothing
 
-        try
-            # the worker was started in an older world
-            request.result = Base.invokelatest(request.wait, request.obj)
-        catch err
-            request.result = err
-            request.failed = true
-        end
+        Core._call_in_world(request.world, perform!, request)
 
         # become available before waking the caller, so that it finds this worker when it
         # immediately waits again
@@ -370,9 +416,9 @@ Wait for `obj` to complete without blocking the calling thread, so that other ta
 on it in the meantime.
 
 `wait(obj)` should perform a blocking wait for `obj`. By default, it is executed on a
-separate thread, so it should block in a GC-safe manner (e.g., using
-[`@gcsafe_ccall`](@ref)) and set up any thread-local state it relies on (e.g., the active
-context).
+separate thread (in the caller's world, i.e., seeing the same method definitions as a
+direct call), so it should block in a GC-safe manner (e.g., using [`@gcsafe_ccall`](@ref))
+and set up any thread-local state it relies on (e.g., the active context).
 
 Alternatively, if the driver can notify completion by calling back, pass a function
 `subscribe(obj, payload::Ptr{Cvoid})` that registers such a callback, which in turn calls
@@ -436,9 +482,9 @@ immediately, while the operation may still be executing.
 In finalizers, where it is not possible to switch tasks, and while generating output (e.g.,
 during precompilation), `wait(obj)` is called on the calling thread instead.
 """
-function cooperative_wait(wait::W, obj; subscribe::S=nothing, isdone::D=nothing,
+function cooperative_wait(wait::W, obj::O; subscribe::S=nothing, isdone::D=nothing,
                           spin::Union{Bool,Real}=true,
-                          cancellable::Bool=false) where {W,S,D}
+                          cancellable::Bool=false) where {W,O,S,D}
     spin isa Bool || spin >= 0 || throw(ArgumentError("spin duration must be non-negative"))
     if GC.in_finalizer() || generating_output()
         return Some(wait(obj))
@@ -470,12 +516,33 @@ function cooperative_wait(wait::W, obj; subscribe::S=nothing, isdone::D=nothing,
 
     # slow path: wait for a completion notification, or hand the wait to a worker thread
     if subscribe === nothing
-        request = WaitRequest(wait, obj)
+        R = Base.promote_op(wait, O)
+        # an interrupt while spinning on the pool's lock is deferred like above
+        acquired = nothing
+        while acquired === nothing
+            try
+                acquired = acquire_request(WaitRequest{W,O,R})
+            catch err
+                (cancellable || !(err isa InterruptException)) && rethrow()
+                interrupt === nothing && (interrupt = err)
+            end
+        end
+        request = acquired::WaitRequest{W,O,R}
+        push!(request.call, (wait, obj))
+        # only box the world when it changed, which is rare
+        world = tls_world_age()
+        old_world = request.world
+        if !(old_world isa UInt && old_world == world)
+            request.world = world
+        end
         slow_wait = () -> wait_cooperatively(request, obj, isdone)
         polled = cancellable ? slow_wait() : wait_uninterrupted(slow_wait, interrupt)
+        exception = request.exception
+        result = isempty(request.result) ? nothing : Some{R}(request.result[1])
+        release_request(request)
         polled && return nothing
-        request.failed && throw(request.result)
-        return Some(request.result)
+        result === nothing && throw(exception)
+        return result
     else
         c = acquire_completion()
         try
