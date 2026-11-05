@@ -86,17 +86,47 @@ end
 @float64_override Base.Math._hypot(x::Float32, y::Float32) =
     invoke(Base.Math._hypot, Tuple{Any,Any}, x, y)
 
-# special/trig.jl: `sind` and friends reduce their argument to [-45°, 45°] in Float32, but
-# convert it to radians and evaluate the sine and cosine kernels in Float64. Keep the
-# reduction, and wrap the converted argument so that the kernels use `sin` and `cos`.
 struct Radians32
     x::Float32
 end
 # π/180 split into a Float32 value and the remainder
-@float64_override Base.Math.deg2rad_ext(x::Float32) =
-    Radians32(muladd(x, 0.017453292f0, x * 1.3519961f-10))
-@float64_override Base.Math.sin_kernel(y::Radians32) = sin(y.x)
-@float64_override Base.Math.cos_kernel(y::Radians32) = cos(y.x)
+deg2rad32(x::Float32) = Radians32(muladd(x, 0.017453292f0, x * 1.3519961f-10))
+
+@static if isdefined(Base.Math, :rem_deg16)
+    # special/trig.jl: `sind` and friends reduce their argument to 11.25°*(n + z) in Float64
+    # (JuliaLang/julia#63544). Reduce it exactly in Float32 to a multiple of 90° and an
+    # angle in [-45°, 45°] instead, which only needs table entries that are 0 or ±1, and
+    # convert that angle to radians so that the kernels use `sin` and `cos`.
+    @float64_override function Base.Math.rem_deg16(a::Float32)
+        a = rem(a, 360f0)
+        q = round(a / 90f0)
+        return deg2rad32(a - 90f0 * q), 8 * unsafe_trunc(Int64, q)
+    end
+    # sin and cos of n*π/16 + y for n a multiple of 8. Subtracting from zero instead of
+    # negating gives zero results the signs of Base's.
+    function sincos_quadrant(y::Radians32, n::Int64)
+        s, c = sin(y.x), cos(y.x)
+        q = (n >> 3) & 3
+        q == 0 && return s, c
+        q == 1 && return c, 0f0 - s
+        q == 2 && return 0f0 - s, 0f0 - c
+        return 0f0 - c, s
+    end
+    @float64_override Base.Math.sincos16_kernel(y::Radians32, n::Int64) =
+        sincos_quadrant(y, n)
+    @float64_override function Base.Math.tan16(y::Radians32, n::Int64)
+        s, c = sincos_quadrant(y, n)
+        return s / c
+    end
+else
+    # special/trig.jl: `sind` and friends reduce their argument to [-45°, 45°] in Float32,
+    # but convert it to radians and evaluate the sine and cosine kernels in Float64. Keep
+    # the reduction, and wrap the converted argument so that the kernels use `sin` and
+    # `cos`.
+    @float64_override Base.Math.deg2rad_ext(x::Float32) = deg2rad32(x)
+    @float64_override Base.Math.sin_kernel(y::Radians32) = sin(y.x)
+    @float64_override Base.Math.cos_kernel(y::Radians32) = cos(y.x)
+end
 
 # special/trig.jl: `sincospi` uses Float64 kernels (as do `sinpi` and `cospi`, which the
 # back-end is expected to override).

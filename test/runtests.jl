@@ -699,10 +699,29 @@ using IOCapture
 
         # the kernels used by `sind` and friends, on the converted argument
         @testset "degree trigonometry" begin
-            for x in (0.001f0, 1f0, 30f0, 44.99f0, -45f0)
-                y = override(Base.Math.deg2rad_ext, x)
-                @test ulps(override(Base.Math.sin_kernel, y), sind(big(x))) <= 1
-                @test ulps(override(Base.Math.cos_kernel, y), cosd(big(x))) <= 1
+            if isdefined(Base.Math, :rem_deg16)
+                for x in (0.001f0, 1f0, 30f0, 44.99f0, 45f0, 89f0, 135f0, 200f0, 300f0,
+                          359.9f0, prevfloat(45f0), nextfloat(45f0), 1f7, 3f10,
+                          floatmax(Float32))
+                    y, n = override(Base.Math.rem_deg16, x)
+                    s, c = override(Base.Math.sincos16_kernel, y, n)
+                    @test ulps(s, sind(big(x))) <= 1
+                    @test ulps(c, cosd(big(x))) <= 1
+                    @test override(Base.Math.tan16, y, n) ≈ tand(x)
+                end
+                # exact results, including the signs of zeros
+                for x in (0f0, 90f0, 180f0, 270f0, 360f0, 720f0)
+                    y, n = override(Base.Math.rem_deg16, x)
+                    s, c = override(Base.Math.sincos16_kernel, y, n)
+                    @test isequal((s, c), sincosd(x))
+                    @test isequal(override(Base.Math.tan16, y, n), tand(x))
+                end
+            else
+                for x in (0.001f0, 1f0, 30f0, 44.99f0, -45f0)
+                    y = override(Base.Math.deg2rad_ext, x)
+                    @test ulps(override(Base.Math.sin_kernel, y), sind(big(x))) <= 1
+                    @test ulps(override(Base.Math.cos_kernel, y), cosd(big(x))) <= 1
+                end
             end
         end
 
