@@ -667,12 +667,13 @@ using IOCapture
         @test leaks == expected
     end
 
-    # the throw overrides construct their exception from constants only, which GPU compilers
-    # can compile, unlike Base's methods that format a message
+    # the throw overrides throw with a constant message (through `device_throw`), which GPU
+    # compilers can compile, unlike Base's methods that format a message
     @testset "throw overrides" begin
-        # does `method` only construct an `E` from a string literal, and throw it? this checks
-        # the lowered code, which unlike inferred code doesn't depend on the Julia version or
-        # on options like `--code-coverage`
+        # does `method` only construct an `E` from a string literal and throw it, or throw it
+        # through `device_throw` with a constant message? this checks the lowered code, which
+        # unlike inferred code doesn't depend on the Julia version or on options like
+        # `--code-coverage`
         function throws_constant(method::Method, E)
             code = Base.uncompressed_ast(method).code
             # Julia 1.11+ lowers global references to separate statements
@@ -690,6 +691,9 @@ using IOCapture
                         continue
                     elseif f === E && length(args) == 1 && args[1] isa String
                         constructed = true
+                    elseif f === GPUToolbox.Overlays.device_throw && length(args) == 2 &&
+                           resolve(args[1]) === E && args[2] isa Val
+                        constructed = true    # the message is carried in the `Val`'s type
                     else
                         return false    # e.g. formatting a message
                     end
@@ -707,6 +711,8 @@ using IOCapture
                 throw(ArgumentError("constant"))
             Base.Experimental.@overlay table f(::Type{T}) where {T<:AbstractFloat} =
                 throw(ArgumentError("formatted $T"))
+            Base.Experimental.@overlay table f(::Type{T}) where {T<:Complex} =
+                $GPUToolbox.Overlays.@device_throw ArgumentError("constant")
         end
         lookup(table, sig) =
             only(Base._methods_by_ftype(sig, table, -1, Base.get_world_counter())).method
@@ -715,6 +721,9 @@ using IOCapture
         @test throws_constant(lookup(ThrowTest.table, int), ArgumentError)
         @test !throws_constant(lookup(ThrowTest.table, int), OverflowError)
         @test !throws_constant(lookup(ThrowTest.table, float), ArgumentError)
+        complex = Tuple{typeof(ThrowTest.f), Type{ComplexF32}}
+        @test throws_constant(lookup(ThrowTest.table, complex), ArgumentError)
+        @test !throws_constant(lookup(ThrowTest.table, complex), OverflowError)
 
         table = GPUToolbox.Overlays.throw_overrides
         overrides = Any[]
