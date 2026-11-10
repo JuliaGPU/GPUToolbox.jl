@@ -61,9 +61,20 @@ To keep the order of the stack from affecting correctness, overrides in this mod
 - don't overlap with the overrides in other tables in this module, so that the relative
   order of these tables doesn't matter;
 - document which functions they expect the stack to provide (e.g., `Float64`-free
-  elementary functions).
+  elementary functions);
+- throw exceptions with [`device_throw`](@ref) (see below).
 
 Back-ends can check their stack with [`audit`](@ref), e.g., as part of their tests.
+
+# Exceptions
+
+GPU compilers can't throw exception objects: they only report that an exception occurred,
+and at most which function threw it. Back-ends therefore replace Base's methods that throw
+with methods that report the exception with a constant type name and message, using their
+own runtime. Shared overrides can't call into that runtime, so they throw with
+[`device_throw`](@ref) instead, passing the exception type and message as constants. Each
+back-end replaces that function in its own method table, which makes the exceptions thrown
+by shared overrides report like the back-end's own.
 
 # Device-only functionality
 
@@ -86,6 +97,7 @@ load (nor does a package image on Windows). Back-ends can check that with
 """
 module Overlays
 
+include("overlays/exceptions.jl")
 include("overlays/float64.jl")
 include("overlays/int128.jl")
 include("overlays/throw.jl")
