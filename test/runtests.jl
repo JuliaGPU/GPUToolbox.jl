@@ -491,6 +491,28 @@ using IOCapture
         @test occursin("=", c.output)
     end
 
+    @testset "device_throw" begin
+        Overlays = GPUToolbox.Overlays
+        f() = GPUToolbox.Overlays.@device_throw ArgumentError("invalid argument")
+        g() = GPUToolbox.Overlays.@device_throw OverflowError("overflow")
+        @test_throws ArgumentError("invalid argument") f()
+        @test_throws OverflowError("overflow") g()
+
+        # the type and message reach `device_throw` as constants, so that back-ends can
+        # report them, and the fallback throws without converting the message at run time
+        ex = macroexpand(@__MODULE__,
+                         :(GPUToolbox.Overlays.@device_throw ArgumentError("invalid argument")))
+        @test ex == Expr(:call, Overlays.device_throw, :ArgumentError,
+                         Val(Symbol("invalid argument")))
+        ci = only(code_lowered(Overlays.reason_string, (Val{Symbol("invalid argument")},)))
+        @test ci.code == [Core.ReturnNode("invalid argument")]
+
+        @test_throws "string literal" macroexpand(@__MODULE__,
+            :(GPUToolbox.Overlays.@device_throw ArgumentError(msg)))
+        @test_throws "string literal" macroexpand(@__MODULE__,
+            :(GPUToolbox.Overlays.@device_throw "message"))
+    end
+
     @testset "overlay audit" begin
         Overlays = GPUToolbox.Overlays
         # every override in the shared tables replaces a Base method, and they don't overlap
