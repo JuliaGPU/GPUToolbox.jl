@@ -494,7 +494,8 @@ using IOCapture
     @testset "overlay audit" begin
         Overlays = GPUToolbox.Overlays
         # every override in the shared tables replaces a Base method, and they don't overlap
-        @test isempty(Overlays.audit(Overlays.float64_overrides, Overlays.int128_overrides))
+        @test isempty(Overlays.audit(Overlays.float64_overrides, Overlays.int128_overrides,
+                                     Overlays.throw_overrides))
 
         @eval module AuditTest
             Base.Experimental.@MethodTable(high)
@@ -642,6 +643,74 @@ using IOCapture
         # Julia 1.10 and 1.11 only find methods of functions bound in the module, which
         # includes these
         @test leaks == expected
+    end
+
+    # the throw overrides construct their exception from constants only, which GPU compilers
+    # can compile, unlike Base's methods that format a message
+    @testset "throw overrides" begin
+        # does `method` only construct an `E` from a string literal, and throw it? this checks
+        # the lowered code, which unlike inferred code doesn't depend on the Julia version or
+        # on options like `--code-coverage`
+        function throws_constant(method::Method, E)
+            code = Base.uncompressed_ast(method).code
+            # Julia 1.11+ lowers global references to separate statements
+            resolve(x) = x isa GlobalRef ? getglobal(x.mod, x.name) :
+                         x isa Core.SSAValue && code[x.id] isa GlobalRef ? resolve(code[x.id]) :
+                         x
+            constructed = false
+            for stmt in code
+                if stmt === nothing || stmt isa Core.ReturnNode || stmt isa LineNumberNode ||
+                   stmt isa GlobalRef || Meta.isexpr(stmt, :meta)
+                    continue
+                elseif Meta.isexpr(stmt, :call)
+                    f, args = resolve(stmt.args[1]), stmt.args[2:end]
+                    if f === throw && length(args) == 1 && args[1] isa Core.SSAValue
+                        continue
+                    elseif f === E && length(args) == 1 && args[1] isa String
+                        constructed = true
+                    else
+                        return false    # e.g. formatting a message
+                    end
+                else
+                    return false
+                end
+            end
+            return constructed
+        end
+
+        @eval module ThrowTest
+            Base.Experimental.@MethodTable(table)
+            f(T) = T
+            Base.Experimental.@overlay table f(::Type{T}) where {T<:Integer} =
+                throw(ArgumentError("constant"))
+            Base.Experimental.@overlay table f(::Type{T}) where {T<:AbstractFloat} =
+                throw(ArgumentError("formatted $T"))
+        end
+        lookup(table, sig) =
+            only(Base._methods_by_ftype(sig, table, -1, Base.get_world_counter())).method
+        int = Tuple{typeof(ThrowTest.f), Type{Int}}
+        float = Tuple{typeof(ThrowTest.f), Type{Float32}}
+        @test throws_constant(lookup(ThrowTest.table, int), ArgumentError)
+        @test !throws_constant(lookup(ThrowTest.table, int), OverflowError)
+        @test !throws_constant(lookup(ThrowTest.table, float), ArgumentError)
+
+        table = GPUToolbox.Overlays.throw_overrides
+        overrides = Any[]
+        if isdefined(Base, :__throw_rational_argerror_typemin)
+            push!(overrides, (Base.__throw_rational_argerror_typemin, ArgumentError))
+        end
+        if VERSION < v"1.12-"
+            push!(overrides, (Base.__throw_rational_numerator_typemin, OverflowError))
+        end
+        table_methods = Method[]
+        Base.visit(m -> push!(table_methods, m), table)
+        @test length(table_methods) == length(overrides)
+        for (f, E) in overrides
+            sig = Tuple{typeof(f), Type{Int}}
+            @test throws_constant(lookup(table, sig), E)
+            # Base formats the message
+            @test !throws_constant(which(f, Tuple{Type{Int}}), E)
+        end
     end
 
     # device overrides can be called on the CPU by invoking their method directly, but that

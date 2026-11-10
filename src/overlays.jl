@@ -81,11 +81,14 @@ load (nor does a package image on Windows). Back-ends can check that with
   single- or half-precision results.
 - [`int128_overrides`](@ref): overrides of Base methods that use 128-bit integers to compute
   results for narrower ones.
+- [`throw_overrides`](@ref): overrides of Base methods that throw exceptions with messages
+  built at run time.
 """
 module Overlays
 
 include("overlays/float64.jl")
 include("overlays/int128.jl")
+include("overlays/throw.jl")
 include("overlays/device.jl")
 
 
