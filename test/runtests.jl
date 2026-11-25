@@ -731,19 +731,44 @@ using IOCapture
         table = GPUToolbox.Overlays.throw_overrides
         overrides = Any[]
         if isdefined(Base, :__throw_rational_argerror_typemin)
-            push!(overrides, (Base.__throw_rational_argerror_typemin, ArgumentError))
+            push!(overrides, (Base.__throw_rational_argerror_typemin, (Type{Int},),
+                              ArgumentError))
         end
         if VERSION < v"1.12-"
-            push!(overrides, (Base.__throw_rational_numerator_typemin, OverflowError))
+            push!(overrides, (Base.__throw_rational_numerator_typemin, (Type{Int},),
+                              OverflowError))
+        end
+        # one override covers Base's methods for every type of base
+        for T in (Int, Matrix{Int}, Float32)
+            push!(overrides, (Base.throw_domerr_powbysq, (T, Int), DomainError))
         end
         table_methods = Method[]
         Base.visit(m -> push!(table_methods, m), table)
-        @test length(table_methods) == length(overrides)
-        for (f, E) in overrides
-            sig = Tuple{typeof(f), Type{Int}}
+        @test length(table_methods) == length(unique(first, overrides))
+        for (f, argtypes, E) in overrides
+            sig = Tuple{typeof(f), argtypes...}
             @test throws_constant(lookup(table, sig), E)
             # Base formats the message
-            @test !throws_constant(which(f, Tuple{Type{Int}}), E)
+            @test !throws_constant(which(f, Tuple{argtypes...}), E)
+        end
+    end
+
+    # overrides in a table must not shadow one another. When Julia 1.12 or 1.13 loads a
+    # package image, it only trusts a kernel's edge to an overlay method if no more specific
+    # method of the same table intersects it (the method's `interferences` are empty). Other
+    # edges are verified against the global method table, which doesn't have the overlay, so
+    # the kernel is dropped from the image and compiled again in every session
+    # (JuliaLang/julia#64727).
+    hasfield(Method, :interferences) && @testset "overlays don't shadow one another" begin
+        Overlays = GPUToolbox.Overlays
+        for table in (Overlays.float64_overrides, Overlays.int128_overrides,
+                      Overlays.throw_overrides)
+            shadowed = Method[]
+            Base.visit(table) do m
+                I = m.interferences
+                any(i -> isassigned(I, i), eachindex(I)) && push!(shadowed, m)
+            end
+            @test isempty(shadowed)
         end
     end
 
@@ -754,6 +779,14 @@ using IOCapture
             sig = Tuple{typeof(f), map(typeof, args)...}
             matches = Base._methods_by_ftype(sig, table, -1, Base.get_world_counter())
             invoke(f, only(matches).method, args...)
+        end
+
+        @testset "throw_domerr_powbysq" begin
+            msg = "Cannot raise an integer to a negative power"
+            for x in (2, [1 2; 3 4], 2f0)
+                @test_throws DomainError(nothing, msg) override(Base.throw_domerr_powbysq,
+                    x, -1; table=GPUToolbox.Overlays.throw_overrides)
+            end
         end
 
         # error in ulps, compared to a more precise result

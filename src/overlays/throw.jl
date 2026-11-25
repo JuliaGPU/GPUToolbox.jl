@@ -10,9 +10,10 @@ message built at run time, e.g., by interpolating values into a string. GPU comp
 compile that code, so these overrides throw the same exception with a constant message
 instead, using [`device_throw`](@ref).
 
-This currently covers two helpers that `Rational` arithmetic calls on Julia 1.10 and 1.11,
-whose messages include the integer type. Julia 1.11 removed one of them, and Julia 1.12
-builds the message of the other lazily, so the table is empty on later versions.
+This covers `Base.throw_domerr_powbysq`, which integer exponentiation calls for a negative
+power, and two helpers that `Rational` arithmetic calls on Julia 1.10 and 1.11, whose
+messages include the integer type (Julia 1.11 removed one of them, and Julia 1.12 builds the
+message of the other lazily).
 
 See [`GPUToolbox.Overlays`](@ref) for how to use this table.
 """
@@ -34,3 +35,13 @@ end
     @throw_override @noinline Base.__throw_rational_numerator_typemin(::Type{<:Integer}) =
         @device_throw OverflowError("rational numerator is typemin")
 end
+
+# intfuncs.jl: a single override for Base's three methods (for `::Any`, `::Integer` and
+# `::AbstractMatrix` bases), whose messages differ only in their advice. Overrides of one
+# table shouldn't shadow one another: when Julia 1.12 or 1.13 loads a package image, it only
+# trusts a kernel's edge to an overlay method that no more specific method of the same table
+# intersects, and verifies other edges against the global method table, which doesn't have
+# the overlay, so the kernel is dropped and compiled again in every session
+# (JuliaLang/julia#64727).
+@throw_override @noinline Base.throw_domerr_powbysq(::Any, p) =
+    @device_throw DomainError("Cannot raise an integer to a negative power")
