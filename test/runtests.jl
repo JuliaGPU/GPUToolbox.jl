@@ -497,6 +497,9 @@ using IOCapture
         g() = GPUToolbox.Overlays.@device_throw OverflowError("overflow")
         @test_throws ArgumentError("invalid argument") f()
         @test_throws OverflowError("overflow") g()
+        # `DomainError(msg)` would take the message as the offending value
+        h() = GPUToolbox.Overlays.@device_throw DomainError("out of domain")
+        @test_throws DomainError(nothing, "out of domain") h()
 
         # the type and message reach `device_throw` as constants, so that back-ends can
         # report them, and the fallback throws without converting the message at run time
