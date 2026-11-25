@@ -10,8 +10,9 @@ drop the exception object, so a plain `throw(E(msg))` is only reported as an exc
 unknown type.
 
 This method throws `E(String(reason))`, which assumes that `E` has a constructor that takes
-the message (as `ArgumentError`, `OverflowError` and `ErrorException` do, but not, e.g.,
-`DomainError`, which would print the message as the offending value).
+the message (as `ArgumentError`, `OverflowError` and `ErrorException` do). A `DomainError`,
+whose one-argument constructor takes the offending value, is thrown as
+`DomainError(nothing, String(reason))`, as the value isn't known.
 
 Back-ends replace it in their own method table. Both arguments are constants, so a
 back-end's method can pass them to a reporting function that expects compile-time constants,
@@ -37,6 +38,8 @@ A back-end's method must throw, like this one does.
 """
 @noinline device_throw(::Type{E}, reason::Val) where {E<:Exception} =
     throw(E(reason_string(reason)))
+@noinline device_throw(::Type{DomainError}, reason::Val) =
+    throw(DomainError(nothing, reason_string(reason)))
 
 # the reason as a constant string: converting a Symbol at run time requires a call into the
 # runtime, which GPU compilers can't compile
